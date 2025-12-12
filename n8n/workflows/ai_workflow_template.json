@@ -1,0 +1,148 @@
+{
+  "name": "AI工作流模板",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "webhook-trigger",
+      "name": "Webhook触发器",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "ai-workflow-webhook"
+    },
+    {
+      "parameters": {
+        "functionCode": "// 语义分析节点\nconst query = items[0].json.query;\nconst userId = items[0].json.user_id || 'default';\n\n// 调用意图分析API\nconst intentResponse = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'http://ai-workflow-backend:8000/api/intent/analyze',\n  body: { query },\n  json: true\n});\n\nreturn [{\n  json: {\n    query,\n    user_id: userId,\n    intent: intentResponse.data,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "intent-analysis",
+      "name": "意图分析",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// 任务规划节点\nconst { query, intent } = items[0].json;\n\n// 调用任务规划API\nconst planResponse = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'http://ai-workflow-backend:8000/api/task/plan',\n  body: { query, intent },\n  json: true\n});\n\nreturn [{\n  json: {\n    ...items[0].json,\n    tasks: planResponse.data\n  }\n}];"
+      },
+      "id": "task-planning",
+      "name": "任务规划",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// 知识检索节点\nconst { query } = items[0].json;\n\n// 调用向量检索API\nconst searchResponse = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'http://ai-workflow-backend:8000/api/knowledge/search',\n  body: { query, top_k: 5 },\n  json: true\n});\n\nreturn [{\n  json: {\n    ...items[0].json,\n    knowledge: searchResponse.data\n  }\n}];"
+      },
+      "id": "knowledge-retrieval",
+      "name": "知识检索",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// 推理生成节点\nconst { query, intent, tasks, knowledge } = items[0].json;\n\n// 调用推理模型API\nconst reasoningResponse = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'http://ai-workflow-backend:8000/api/reasoning/generate',\n  body: { query, intent, tasks, knowledge },\n  json: true\n});\n\nreturn [{\n  json: {\n    ...items[0].json,\n    reasoning: reasoningResponse.data,\n    workflow_id: `wf_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`\n  }\n}];"
+      },
+      "id": "reasoning-generation",
+      "name": "推理生成",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// 结果存储节点\nconst workflowData = items[0].json;\n\n// 异步存储到向量数据库\nconst storeResponse = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'http://ai-workflow-backend:8000/api/knowledge/store',\n  body: {\n    workflow_id: workflowData.workflow_id,\n    content: workflowData.reasoning.output.content,\n    metadata: {\n      query: workflowData.query,\n      intent: workflowData.intent.category,\n      timestamp: workflowData.timestamp\n    }\n  },\n  json: true\n});\n\n// 返回最终结果\nreturn [{\n  json: {\n    success: true,\n    workflow_id: workflowData.workflow_id,\n    result: workflowData.reasoning.output,\n    execution_summary: {\n      intent: workflowData.intent,\n      tasks_count: workflowData.tasks.length,\n      knowledge_count: workflowData.knowledge.length,\n      stored: storeResponse.success\n    }\n  }\n}];"
+      },
+      "id": "result-storage",
+      "name": "结果存储",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "webhook-response",
+      "name": "返回结果",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1560, 300]
+    }
+  ],
+  "connections": {
+    "Webhook触发器": {
+      "main": [
+        [
+          {
+            "node": "意图分析",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "意图分析": {
+      "main": [
+        [
+          {
+            "node": "任务规划",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "任务规划": {
+      "main": [
+        [
+          {
+            "node": "知识检索",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "知识检索": {
+      "main": [
+        [
+          {
+            "node": "推理生成",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "推理生成": {
+      "main": [
+        [
+          {
+            "node": "结果存储",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "结果存储": {
+      "main": [
+        [
+          {
+            "node": "返回结果",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {},
+  "createdAt": "2024-12-12T00:00:00.000Z",
+  "updatedAt": "2024-12-12T00:00:00.000Z",
+  "id": "ai-workflow-template"
+}

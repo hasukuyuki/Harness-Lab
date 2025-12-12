@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Data files
+data/
+*.db
+*.pkl
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Project specific
+models/
+steam on docker/
+*.bash
+*.jsx
+omni_realtime_client.py
+gpu-switcher.sh
+example_usage.py
+vad_mode.py
+postgresql-15-main.log.*
+1.txt
+2025-11-.txt
+202512020010.bash
+App.jsx.jsx
+新建文本文档*
+说明.txt
+ai_workflow_prd.txt

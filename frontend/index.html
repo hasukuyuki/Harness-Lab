@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 工作流平台</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            width: 90%;
+            max-width: 800px;
+            padding: 2rem;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        
+        .header h1 {
+            color: #333;
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+        
+        .header p {
+            color: #666;
+            font-size: 1.1rem;
+        }
+        
+        .chat-container {
+            height: 400px;
+            border: 2px solid #f0f0f0;
+            border-radius: 15px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            overflow-y: auto;
+            background: #fafafa;
+        }
+        
+        .message {
+            margin-bottom: 1rem;
+            padding: 1rem;
+            border-radius: 10px;
+            max-width: 80%;
+        }
+        
+        .message.user {
+            background: #667eea;
+            color: white;
+            margin-left: auto;
+        }
+        
+        .message.assistant {
+            background: white;
+            border: 1px solid #e0e0e0;
+        }
+        
+        .input-container {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+        
+        .input-field {
+            flex: 1;
+            padding: 1rem;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 1rem;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        
+        .input-field:focus {
+            border-color: #667eea;
+        }
+        
+        .send-button {
+            padding: 1rem 2rem;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        
+        .send-button:hover {
+            background: #5a6fd8;
+        }
+        
+        .send-button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .status {
+            text-align: center;
+            color: #666;
+            font-style: italic;
+            margin-bottom: 1rem;
+        }
+        
+        .workflow-info {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 1rem;
+            margin-top: 1rem;
+            font-size: 0.9rem;
+        }
+        
+        .workflow-info h4 {
+            color: #333;
+            margin-bottom: 0.5rem;
+        }
+        
+        .workflow-info .detail {
+            margin-bottom: 0.5rem;
+        }
+        
+        .feedback-container {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-top: 1rem;
+            padding: 1rem;
+            background: #f0f8ff;
+            border-radius: 10px;
+        }
+        
+        .rating {
+            display: flex;
+            gap: 0.25rem;
+        }
+        
+        .star {
+            font-size: 1.5rem;
+            color: #ddd;
+            cursor: pointer;
+            transition: color 0.2s;
+        }
+        
+        .star.active {
+            color: #ffd700;
+        }
+        
+        .feedback-button {
+            padding: 0.5rem 1rem;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 AI 工作流平台</h1>
+            <p>智能语义理解 · 任务拆解 · 知识检索 · 自我迭代</p>
+        </div>
+        
+        <div class="chat-container" id="chatContainer">
+            <div class="message assistant">
+                <strong>AI助手:</strong> 您好！我是AI工作流助手，可以帮您处理各种问题和任务。请输入您的需求，我会进行语义分析、任务拆解，并从知识库中检索相关信息来为您提供帮助。
+            </div>
+        </div>
+        
+        <div class="status" id="status"></div>
+        
+        <div class="input-container">
+            <input type="text" class="input-field" id="queryInput" placeholder="请输入您的问题或任务..." />
+            <button class="send-button" id="sendButton">发送</button>
+        </div>
+    </div>
+
+    <script>
+        const chatContainer = document.getElementById('chatContainer');
+        const queryInput = document.getElementById('queryInput');
+        const sendButton = document.getElementById('sendButton');
+        const status = document.getElementById('status');
+        
+        let currentWorkflowId = null;
+        
+        // 发送消息
+        async function sendMessage() {
+            const query = queryInput.value.trim();
+            if (!query) return;
+            
+            // 添加用户消息
+            addMessage('user', query);
+            queryInput.value = '';
+            sendButton.disabled = true;
+            status.textContent = '正在处理中...';
+            
+            try {
+                const response = await fetch('/api/workflow/execute', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ query })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    currentWorkflowId = result.data.workflow_id;
+                    displayWorkflowResult(result.data);
+                } else {
+                    addMessage('assistant', '抱歉，处理您的请求时出现了错误。请稍后重试。');
+                }
+            } catch (error) {
+                addMessage('assistant', '网络连接错误，请检查后端服务是否正常运行。');
+            }
+            
+            sendButton.disabled = false;
+            status.textContent = '';
+        }
+        
+        // 添加消息到聊天容器
+        function addMessage(sender, content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${sender}`;
+            
+            if (sender === 'user') {
+                messageDiv.innerHTML = `<strong>您:</strong> ${content}`;
+            } else {
+                messageDiv.innerHTML = `<strong>AI助手:</strong> ${content}`;
+            }
+            
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        // 显示工作流结果
+        function displayWorkflowResult(data) {
+            const reasoning = data.reasoning;
+            
+            if (reasoning && reasoning.success) {
+                const output = reasoning.output;
+                addMessage('assistant', output.content);
+                
+                // 添加工作流详情
+                const workflowInfo = document.createElement('div');
+                workflowInfo.className = 'workflow-info';
+                workflowInfo.innerHTML = `
+                    <h4>📊 工作流详情</h4>
+                    <div class="detail"><strong>意图识别:</strong> ${data.intent.category} (置信度: ${(data.intent.confidence * 100).toFixed(1)}%)</div>
+                    <div class="detail"><strong>任务数量:</strong> ${data.tasks.length} 个</div>
+                    <div class="detail"><strong>知识检索:</strong> ${data.knowledge.length} 条相关信息</div>
+                    <div class="detail"><strong>执行时间:</strong> ${data.execution_time.toFixed(2)} 秒</div>
+                `;
+                
+                // 添加反馈组件
+                const feedbackDiv = document.createElement('div');
+                feedbackDiv.className = 'feedback-container';
+                feedbackDiv.innerHTML = `
+                    <span>请为这次回答评分:</span>
+                    <div class="rating" id="rating-${data.workflow_id}">
+                        ${[1,2,3,4,5].map(i => `<span class="star" data-rating="${i}">⭐</span>`).join('')}
+                    </div>
+                    <button class="feedback-button" onclick="submitFeedback('${data.workflow_id}')">提交反馈</button>
+                `;
+                
+                workflowInfo.appendChild(feedbackDiv);
+                chatContainer.appendChild(workflowInfo);
+                
+                // 绑定评分事件
+                bindRatingEvents(data.workflow_id);
+                
+            } else {
+                addMessage('assistant', '抱歉，推理过程中出现了问题。');
+            }
+            
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        // 绑定评分事件
+        function bindRatingEvents(workflowId) {
+            const stars = document.querySelectorAll(`#rating-${workflowId} .star`);
+            stars.forEach(star => {
+                star.addEventListener('click', function() {
+                    const rating = parseInt(this.dataset.rating);
+                    updateStarDisplay(workflowId, rating);
+                });
+            });
+        }
+        
+        // 更新星星显示
+        function updateStarDisplay(workflowId, rating) {
+            const stars = document.querySelectorAll(`#rating-${workflowId} .star`);
+            stars.forEach((star, index) => {
+                if (index < rating) {
+                    star.classList.add('active');
+                } else {
+                    star.classList.remove('active');
+                }
+            });
+        }
+        
+        // 提交反馈
+        async function submitFeedback(workflowId) {
+            const activeStars = document.querySelectorAll(`#rating-${workflowId} .star.active`);
+            const rating = activeStars.length;
+            
+            if (rating === 0) {
+                alert('请先选择评分');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/feedback', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        workflow_id: workflowId,
+                        rating: rating
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    addMessage('assistant', '感谢您的反馈！这将帮助我不断改进。');
+                } else {
+                    addMessage('assistant', '反馈提交失败，请稍后重试。');
+                }
+            } catch (error) {
+                addMessage('assistant', '反馈提交时出现网络错误。');
+            }
+        }
+        
+        // 事件监听
+        sendButton.addEventListener('click', sendMessage);
+        queryInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+        
+        // 页面加载完成后聚焦输入框
+        window.addEventListener('load', function() {
+            queryInput.focus();
+        });
+    </script>
+</body>
+</html>

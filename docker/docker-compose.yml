@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  # AI工作流后端服务
+  ai-workflow-backend:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.backend
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      - VECTOR_DB_PATH=/app/data/vector_db
+      - PREFERENCES_DB_PATH=/app/data/preferences.db
+    volumes:
+      - ../data:/app/data
+      - ../backend:/app/backend
+    depends_on:
+      - n8n
+    networks:
+      - ai-workflow-network
+
+  # n8n 工作流引擎
+  n8n:
+    image: n8nio/n8n:latest
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=admin123
+      - N8N_HOST=0.0.0.0
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - WEBHOOK_URL=http://localhost:5678/
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ../n8n/workflows:/home/node/.n8n/workflows
+    networks:
+      - ai-workflow-network
+
+  # 前端服务 (Nginx)
+  ai-workflow-frontend:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - ai-workflow-backend
+    networks:
+      - ai-workflow-network
+
+volumes:
+  n8n_data:
+
+networks:
+  ai-workflow-network:
+    driver: bridge
