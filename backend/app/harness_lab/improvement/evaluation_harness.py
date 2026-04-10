@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from statistics import mean
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,6 +24,11 @@ BENCHMARK_BUCKETS = [
     "approval_required",
     "recovery_path",
     "prompt_pressure",
+    "handoff_chain",
+    "review_gate",
+    "repair_loop",
+    "approval_sandbox",
+    "role_dispatch",
 ]
 
 
@@ -118,6 +124,18 @@ class EvaluationHarnessService:
             blockers.append("replay evaluation reported a safety regression")
         if benchmark and any(failure.kind == "safety_regression" for failure in benchmark.hard_failures):
             blockers.append("benchmark evaluation reported a safety regression")
+        if benchmark:
+            benchmark_buckets = {result.bucket: result for result in benchmark.bucket_results}
+            for bucket in ("handoff_chain", "review_gate"):
+                result = benchmark_buckets.get(bucket)
+                if not result or result.total == 0:
+                    blockers.append(f"benchmark bucket {bucket} has no eligible traces")
+                elif result.failed > 0:
+                    blockers.append(f"benchmark bucket {bucket} contains regressions")
+            for bucket in ("role_dispatch", "approval_sandbox"):
+                result = benchmark_buckets.get(bucket)
+                if result and result.failed > 0:
+                    blockers.append(f"benchmark bucket {bucket} reported a safety regression")
         if approval_required and not approval_satisfied:
             blockers.append("workflow candidate requires human approval")
 
@@ -216,6 +234,28 @@ class EvaluationHarnessService:
                             summary="Replay tool path does not match the original execution trace.",
                         )
                     )
+            replay_handoffs = replay.get("handoffs") or []
+            replay_reviews = replay.get("review_verdicts") or []
+            if len(replay_handoffs) != len(run.result.get("handoffs", [])):
+                failures.append(
+                    EvaluationFailure(
+                        kind="handoff_mismatch",
+                        severity="hard",
+                        trace_ref=run.run_id,
+                        bucket="handoff_chain",
+                        summary="Replay handoff chain does not match the original run.",
+                    )
+                )
+            if len(replay_reviews) != len(run.result.get("review_verdicts", [])):
+                failures.append(
+                    EvaluationFailure(
+                        kind="review_mismatch",
+                        severity="hard",
+                        trace_ref=run.run_id,
+                        bucket="review_gate",
+                        summary="Replay review verdicts do not match the original run.",
+                    )
+                )
         return failures
 
     def _bucket_results(
@@ -252,7 +292,7 @@ class EvaluationHarnessService:
         coverage_gaps: List[str],
     ) -> List[EvaluationFailure]:
         failures: List[EvaluationFailure] = []
-        critical_buckets = {"safe_read", "model_reflection", "approval_required"}
+        critical_buckets = {"safe_read", "model_reflection", "approval_required", "handoff_chain", "review_gate"}
         for bucket in coverage_gaps:
             if bucket in critical_buckets:
                 failures.append(
@@ -264,7 +304,7 @@ class EvaluationHarnessService:
                     )
                 )
         for result in bucket_results:
-            if result.bucket in {"safe_read", "approval_required"} and result.failed > 0:
+            if result.bucket in {"safe_read", "approval_required", "approval_sandbox", "role_dispatch"} and result.failed > 0:
                 failures.append(
                     EvaluationFailure(
                         kind="safety_regression",
@@ -277,7 +317,11 @@ class EvaluationHarnessService:
 
     def _soft_regressions(self, runs: List[ResearchRun], bucket_results: List[BenchmarkBucketResult]) -> List[EvaluationFailure]:
         regressions: List[EvaluationFailure] = []
-        missing_optional = {item.bucket for item in bucket_results if item.bucket in {"recovery_path", "prompt_pressure"} and item.total == 0}
+        missing_optional = {
+            item.bucket
+            for item in bucket_results
+            if item.bucket in {"recovery_path", "prompt_pressure", "repair_loop", "role_dispatch"} and item.total == 0
+        }
         for bucket in missing_optional:
             regressions.append(
                 EvaluationFailure(
@@ -297,7 +341,7 @@ class EvaluationHarnessService:
                 )
             )
         for result in bucket_results:
-            if result.bucket in {"recovery_path", "prompt_pressure"} and result.total > 0 and result.failed > 0:
+            if result.bucket in {"recovery_path", "prompt_pressure", "repair_loop", "handoff_chain", "review_gate"} and result.total > 0 and result.failed > 0:
                 regressions.append(
                     EvaluationFailure(
                         kind="coverage_regression",
@@ -319,6 +363,22 @@ class EvaluationHarnessService:
         )
         prompt_pressure = [run for run in runs if run.prompt_frame and run.prompt_frame.truncated_blocks]
         coverage = round(sum(item.coverage for item in bucket_results) / float(len(bucket_results)) if bucket_results else 0.0, 3)
+        handoff_counts = [len(run.result.get("handoffs", [])) for run in runs]
+        verdicts = [verdict for run in runs for verdict in run.result.get("review_verdicts", [])]
+        rejects = [verdict for verdict in verdicts if verdict.get("decision") == "request_repair"]
+        role_utilization = [
+            len(
+                {
+                    packet.get("from_role")
+                    for packet in run.result.get("handoffs", [])
+                }
+                | {
+                    packet.get("to_role")
+                    for packet in run.result.get("handoffs", [])
+                }
+            )
+            for run in runs
+        ]
         return {
             "sample_size": len(runs),
             "success_rate": round(len(completed) / float(len(runs)), 3) if runs else 0.0,
@@ -327,11 +387,34 @@ class EvaluationHarnessService:
             "approval_rate": round(approvals / float(len(runs)), 3) if runs else 0.0,
             "prompt_pressure_handling": round(len(prompt_pressure) / float(len(runs)), 3) if runs else 0.0,
             "bucket_coverage": coverage,
+            "handoff_success_rate": round(len([count for count in handoff_counts if count > 0]) / float(len(runs)), 3) if runs else 0.0,
+            "review_reject_rate": round(len(rejects) / float(len(verdicts)), 3) if verdicts else 0.0,
+            "repair_rate": round(len(rejects) / float(len(runs)), 3) if runs else 0.0,
+            "role_utilization": round(mean(role_utilization) / 4.0, 3) if role_utilization else 0.0,
+            "cross_role_latency": round(self._cross_role_latency(runs), 3),
             "average_prompt_size": round(
                 mean([run.prompt_frame.total_token_estimate for run in runs if run.prompt_frame]) if any(run.prompt_frame for run in runs) else 0.0,
                 3,
             ),
         }
+
+    def _cross_role_latency(self, runs: List[ResearchRun]) -> float:
+        latencies: List[float] = []
+        for run in runs:
+            events = self.database.list_events(run_id=run.run_id, limit=500)
+            task_started = {
+                str(event.payload.get("node_id")): datetime.fromisoformat(event.created_at.replace("Z", "+00:00"))
+                for event in events
+                if event.event_type == "task.started" and event.payload.get("node_id")
+            }
+            for packet in run.result.get("handoffs", []):
+                target_node_id = packet.get("task_node_id")
+                created_at = packet.get("created_at")
+                if not target_node_id or not created_at or target_node_id not in task_started:
+                    continue
+                handoff_time = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+                latencies.append(max(0.0, (task_started[target_node_id] - handoff_time).total_seconds()))
+        return mean(latencies) if latencies else 0.0
 
     def _approval_alignment(self, runs: List[ResearchRun]) -> float:
         if not runs:
@@ -368,6 +451,30 @@ class EvaluationHarnessService:
             buckets.append("recovery_path")
         if run.prompt_frame and run.prompt_frame.truncated_blocks:
             buckets.append("prompt_pressure")
+        if run.result.get("handoffs"):
+            buckets.append("handoff_chain")
+        if run.result.get("review_verdicts"):
+            buckets.append("review_gate")
+        if run.execution_trace and run.execution_trace.recovery_events and any(
+            verdict.get("decision") == "request_repair" for verdict in run.result.get("review_verdicts", [])
+        ):
+            buckets.append("repair_loop")
+        if any(
+            call.output.get("sandbox_trace") or call.tool_name in {"shell", "git"}
+            for call in (run.execution_trace.tool_calls if run.execution_trace else [])
+        ) or run.status == "awaiting_approval":
+            buckets.append("approval_sandbox")
+        if len(
+            {
+                packet.get("from_role")
+                for packet in run.result.get("handoffs", [])
+            }
+            | {
+                packet.get("to_role")
+                for packet in run.result.get("handoffs", [])
+            }
+        ) >= 2:
+            buckets.append("role_dispatch")
         return buckets
 
     def _bucket_passed(self, run: ResearchRun, bucket: str) -> bool:
@@ -383,6 +490,31 @@ class EvaluationHarnessService:
             return bool(run.execution_trace and run.execution_trace.recovery_events)
         if bucket == "prompt_pressure":
             return bool(run.prompt_frame and run.prompt_frame.truncated_blocks and run.status in {"completed", "awaiting_approval"})
+        if bucket == "handoff_chain":
+            return bool(run.result.get("handoffs")) and run.status in {"completed", "queued", "awaiting_approval", "recovering", "failed"}
+        if bucket == "review_gate":
+            return bool(run.result.get("review_verdicts"))
+        if bucket == "repair_loop":
+            return bool(run.execution_trace and run.execution_trace.recovery_events) and any(
+                verdict.get("decision") == "request_repair" for verdict in run.result.get("review_verdicts", [])
+            )
+        if bucket == "approval_sandbox":
+            approvals = self.database.list_approvals(run_id=run.run_id)
+            sandboxed = any(
+                call.output.get("sandbox_trace") or call.tool_name in {"shell", "git", "http_fetch"}
+                for call in (run.execution_trace.tool_calls if run.execution_trace else [])
+            )
+            return bool(approvals or sandboxed)
+        if bucket == "role_dispatch":
+            roles = {
+                packet.get("from_role")
+                for packet in run.result.get("handoffs", [])
+            } | {
+                packet.get("to_role")
+                for packet in run.result.get("handoffs", [])
+            }
+            roles.discard(None)
+            return len(roles) >= 2
         return False
 
     def _bucket_regression(self, run: ResearchRun, bucket: str) -> Optional[str]:
@@ -398,6 +530,16 @@ class EvaluationHarnessService:
             return f"{run.run_id}: recovery trace missing recovery events"
         if bucket == "prompt_pressure":
             return f"{run.run_id}: prompt pressure trace did not preserve truncation handling"
+        if bucket == "handoff_chain":
+            return f"{run.run_id}: handoff chain is missing or incomplete"
+        if bucket == "review_gate":
+            return f"{run.run_id}: review gate evidence is missing"
+        if bucket == "repair_loop":
+            return f"{run.run_id}: repair loop trace did not preserve request_repair evidence"
+        if bucket == "approval_sandbox":
+            return f"{run.run_id}: approval or sandbox trace is missing for a risky execution path"
+        if bucket == "role_dispatch":
+            return f"{run.run_id}: role dispatch did not engage multiple roles cleanly"
         return None
 
     def _list_recent_runs(self, limit: int = 60) -> List[ResearchRun]:

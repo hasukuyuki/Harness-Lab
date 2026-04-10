@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+from ..knowledge.service import KnowledgeIndexService
 from ..storage import HarnessLabDatabase
-from ..types import ContextBlock, ContextProfile, IntentDeclaration, ResearchSession
-from ..utils import compact_text, new_id, safe_preview, score_overlap, token_estimate, top_items
+from ..types import ContextBlock, ContextProfile, IntentDeclaration, KnowledgeSearchResult, ResearchSession
+from ..utils import compact_text, new_id, score_overlap, token_estimate, top_items
 
 
 class ContextManager:
     """Layered context assembler for Harness Lab."""
 
-    def __init__(self, database: HarnessLabDatabase) -> None:
+    def __init__(self, database: HarnessLabDatabase, knowledge_index: Optional[KnowledgeIndexService] = None) -> None:
         self.database = database
+        self.knowledge_index = knowledge_index
         self.repo_root = database.repo_root
         self.excluded_prefixes = [
             ".git",
@@ -65,7 +66,8 @@ class ContextManager:
             blocks.append(history)
         path_hint = str(session.context.get("path", "") or "")
         index_limit = int(profile.config.get("index_limit", 6))
-        for file_block in self._index_blocks(selected_goal, path_hint, index_limit):
+        knowledge_result = self._knowledge_result(selected_goal, path_hint, now_intent, index_limit)
+        for file_block in self._index_blocks(knowledge_result):
             blocks.append(file_block)
 
         max_tokens = int(profile.config.get("max_tokens", 1400))
@@ -92,6 +94,7 @@ class ContextManager:
             "max_tokens": max_tokens,
             "used_tokens": token_total,
             "truncated_blocks": truncated,
+            "knowledge_search": knowledge_result.model_dump() if knowledge_result else None,
         }
         return blocks, summary
 
@@ -174,48 +177,64 @@ class ContextManager:
                 break
         return blocks
 
-    def _index_blocks(self, goal: str, path_hint: str, limit: int) -> List[ContextBlock]:
-        candidates: List[Tuple[float, Path]] = []
-        goal_signal = f"{goal} {path_hint}".strip()
-        for path in self._iter_text_files():
-            relative = str(path.relative_to(self.repo_root))
-            score = score_overlap(goal_signal or relative, relative)
-            if path_hint and relative == path_hint:
-                score += 1.5
-            if score <= 0:
-                continue
-            candidates.append((score, path))
-        candidates.sort(key=lambda item: item[0], reverse=True)
+    def _index_blocks(self, result: Optional[KnowledgeSearchResult]) -> List[ContextBlock]:
         blocks: List[ContextBlock] = []
-        for score, path in candidates[:limit]:
-            relative = str(path.relative_to(self.repo_root))
+        if not result:
+            return blocks
+        for hit in result.hits:
+            relative = str(hit.metadata.get("path") or hit.title)
             blocks.append(
                 self._block(
                     layer="index",
-                    block_type="file_preview",
+                    block_type="knowledge_hit",
                     title=relative,
-                    source_ref=f"file://{relative}",
-                    content=safe_preview(path),
-                    score=score,
+                    source_ref=hit.source_ref,
+                    content=hit.snippet,
+                    score=hit.score,
                     selected=False,
-                    metadata={"path": relative},
+                    metadata={
+                        "path": hit.metadata.get("path"),
+                        "chunk_id": hit.chunk_id,
+                        "source_type": hit.source_type,
+                        "used_fallback": result.used_fallback,
+                        "line_start": hit.metadata.get("line_start"),
+                        "line_end": hit.metadata.get("line_end"),
+                    },
                 )
             )
         return blocks
 
-    def _iter_text_files(self):
-        for path in self.repo_root.rglob("*"):
-            if not path.is_file():
-                continue
-            relative = str(path.relative_to(self.repo_root))
-            if any(relative == prefix or relative.startswith(prefix + "/") for prefix in self.excluded_prefixes):
-                continue
-            if path.stat().st_size > 120_000:
-                continue
-            yield path
+    def _knowledge_result(
+        self,
+        goal: str,
+        path_hint: str,
+        intent: Optional[IntentDeclaration],
+        limit: int,
+    ) -> Optional[KnowledgeSearchResult]:
+        if self.knowledge_index is None:
+            return None
+        latest_signal = self._latest_run_signal()
+        query_parts = [goal]
+        if path_hint:
+            query_parts.append(path_hint)
+        if intent:
+            query_parts.extend([intent.task_type, intent.intent])
+        if latest_signal:
+            query_parts.append(latest_signal)
+        return self.knowledge_index.search(
+            query=" ".join(part for part in query_parts if part).strip(),
+            top_k=max(1, limit),
+            path_hint=path_hint or None,
+        )
+
+    def _latest_run_signal(self) -> str:
+        rows = self.database.fetchall("SELECT payload_json FROM runs ORDER BY updated_at DESC LIMIT 1")
+        if not rows:
+            return ""
+        payload = json.loads(rows[0]["payload_json"])
+        return str(payload.get("result", {}).get("summary", "") or "")
 
     @staticmethod
     def _selection_sort_key(block: ContextBlock):
         layer_order = {"structure": 0, "task": 1, "history": 2, "index": 3}
         return (layer_order.get(block.layer, 10), -block.score, block.token_estimate)
-

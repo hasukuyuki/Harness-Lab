@@ -15,6 +15,10 @@ class HarnessLabSettings(BaseModel):
     debug: bool = Field(False, alias="DEBUG")
     redis_namespace: str = Field("harness_lab", alias="HARNESS_REDIS_NAMESPACE")
     artifact_root: str | None = Field(None, alias="HARNESS_ARTIFACT_ROOT")
+    sandbox_backend: str = Field("docker", alias="HARNESS_SANDBOX_BACKEND")
+    sandbox_image: str = Field("harness-lab/sandbox:local", alias="HARNESS_SANDBOX_IMAGE")
+    sandbox_timeout_seconds: int = Field(20, alias="HARNESS_SANDBOX_TIMEOUT_SECONDS")
+    docker_bin: str = Field("docker", alias="HARNESS_DOCKER_BIN")
 
     @classmethod
     def from_env(cls) -> "HarnessLabSettings":
@@ -29,6 +33,10 @@ class HarnessLabSettings(BaseModel):
             "DEBUG": debug,
             "HARNESS_REDIS_NAMESPACE": os.getenv("HARNESS_REDIS_NAMESPACE", "harness_lab"),
             "HARNESS_ARTIFACT_ROOT": os.getenv("HARNESS_ARTIFACT_ROOT"),
+            "HARNESS_SANDBOX_BACKEND": os.getenv("HARNESS_SANDBOX_BACKEND", "docker"),
+            "HARNESS_SANDBOX_IMAGE": os.getenv("HARNESS_SANDBOX_IMAGE", "harness-lab/sandbox:local"),
+            "HARNESS_SANDBOX_TIMEOUT_SECONDS": os.getenv("HARNESS_SANDBOX_TIMEOUT_SECONDS", "20"),
+            "HARNESS_DOCKER_BIN": os.getenv("HARNESS_DOCKER_BIN", "docker"),
         }
         settings = cls.model_validate(env)
         settings.validate_runtime_backends()

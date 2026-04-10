@@ -29,3 +29,6 @@ The active repository surface is the Harness Lab core, mission-control web UI, C
 - The model layer is no longer heuristic-only: intent and reflection already use a provider-backed path with fallback.
 - The execution layer is no longer purely single-worker: runs now materialize mission / attempt / lease entities and can be driven by worker polling.
 - The storage layer has been cut over at the architecture level to Postgres + Redis with fail-fast startup, and the current implementation has now been smoke-tested against real Docker-backed Postgres/Redis. SQLite remains only as a test-only injected store for local regression coverage.
+- The boundary layer is no longer host-only for risky actions: high-risk tools now route through a Docker sandbox with replayable sandbox traces.
+- The orchestration layer is no longer single-agent only: runs now persist mission phase, role timeline, handoff packets, and review verdicts.
+- The improvement layer now consumes multi-agent traces directly to diagnose failure clusters, auto-generate policy/workflow candidates, and auto-run replay + benchmark gate evaluations before promotion.

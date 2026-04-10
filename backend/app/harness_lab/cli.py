@@ -13,7 +13,13 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 
 from backend.app.harness_lab.bootstrap import harness_lab_services  # noqa: E402
-from backend.app.harness_lab.types import RunRequest, SessionRequest, WorkerRegisterRequest  # noqa: E402
+from backend.app.harness_lab.types import (  # noqa: E402
+    KnowledgeReindexRequest,
+    KnowledgeSearchRequest,
+    RunRequest,
+    SessionRequest,
+    WorkerRegisterRequest,
+)
 from backend.app.harness_lab.workers.runtime_client import WorkerExecutionLoop, WorkerRuntimeClient  # noqa: E402
 
 
@@ -62,6 +68,26 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--execution-mode", default="single_worker")
 
     subparsers.add_parser("doctor", help="Run local control-plane diagnostics")
+    subparsers.add_parser("diagnose", help="Summarize multi-agent failure clusters and blockers")
+    subparsers.add_parser("fleet", help="Inspect fleet status")
+
+    queue = subparsers.add_parser("queue", help="Inspect dispatch queues")
+    queue_subparsers = queue.add_subparsers(dest="queue_command", required=True)
+    queue_subparsers.add_parser("inspect", help="Inspect ready-queue shards")
+
+    knowledge = subparsers.add_parser("knowledge", help="Index and search the knowledge runtime")
+    knowledge_subparsers = knowledge.add_subparsers(dest="knowledge_command", required=True)
+
+    knowledge_reindex = knowledge_subparsers.add_parser("reindex", help="Rebuild the knowledge index")
+    knowledge_reindex.add_argument("--scope", choices=["workspace", "docs", "artifacts", "all"], default="all")
+    knowledge_reindex.add_argument("--control-plane-url", default="")
+
+    knowledge_search = knowledge_subparsers.add_parser("search", help="Search the knowledge index")
+    knowledge_search.add_argument("query")
+    knowledge_search.add_argument("--top-k", type=int, default=5)
+    knowledge_search.add_argument("--path-hint", default="")
+    knowledge_search.add_argument("--source-type", action="append", default=[])
+    knowledge_search.add_argument("--control-plane-url", default="")
 
     attach = subparsers.add_parser("attach", help="Inspect the latest or requested run")
     attach.add_argument("--run-id", default="")
@@ -88,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     workers.add_argument("--register", action="store_true")
     workers.add_argument("--label", default="cli-worker")
     workers.add_argument("--capability", action="append", default=[])
+    workers.add_argument("--role-profile", default="")
 
     worker = subparsers.add_parser("worker", help="Operate a remote-style worker daemon")
     worker_subparsers = worker.add_subparsers(dest="worker_command", required=True)
@@ -96,20 +123,35 @@ def build_parser() -> argparse.ArgumentParser:
     worker_register.add_argument("--worker-id", default="")
     worker_register.add_argument("--label", default="cli-worker")
     worker_register.add_argument("--capability", action="append", default=[])
+    worker_register.add_argument("--role-profile", default="")
     worker_register.add_argument("--control-plane-url", default="")
 
     worker_status = worker_subparsers.add_parser("status", help="Inspect worker status")
     worker_status.add_argument("--worker-id", default="")
     worker_status.add_argument("--control-plane-url", default="")
 
+    worker_drain = worker_subparsers.add_parser("drain", help="Drain a worker without taking new tasks")
+    worker_drain.add_argument("worker_id")
+    worker_drain.add_argument("--reason", default="")
+    worker_drain.add_argument("--control-plane-url", default="")
+
+    worker_resume = worker_subparsers.add_parser("resume", help="Resume a drained worker")
+    worker_resume.add_argument("worker_id")
+    worker_resume.add_argument("--control-plane-url", default="")
+
     worker_serve = worker_subparsers.add_parser("serve", help="Run a polling worker daemon")
     worker_serve.add_argument("--worker-id", default="")
     worker_serve.add_argument("--label", default="cli-worker")
     worker_serve.add_argument("--capability", action="append", default=[])
+    worker_serve.add_argument("--role-profile", default="")
     worker_serve.add_argument("--control-plane-url", default="")
     worker_serve.add_argument("--interval", type=float, default=1.0)
     worker_serve.add_argument("--once", action="store_true")
     worker_serve.add_argument("--max-tasks", type=int, default=1)
+
+    sandbox = subparsers.add_parser("sandbox", help="Inspect local sandbox readiness")
+    sandbox_subparsers = sandbox.add_subparsers(dest="sandbox_command", required=True)
+    sandbox_subparsers.add_parser("probe", help="Probe Docker sandbox readiness")
 
     runs = subparsers.add_parser("runs", help="Inspect run execution state")
     run_subparsers = runs.add_subparsers(dest="runs_command", required=True)
@@ -129,6 +171,51 @@ def main() -> None:
     if args.command == "doctor":
         _emit(harness_lab_services.doctor_report(), args.output_format)
         return
+
+    if args.command == "fleet":
+        _emit(harness_lab_services.runtime.fleet_status().model_dump(), args.output_format)
+        return
+
+    if args.command == "queue" and args.queue_command == "inspect":
+        _emit([item.model_dump() for item in harness_lab_services.runtime.queue_status()], args.output_format)
+        return
+
+    if args.command == "diagnose":
+        report = harness_lab_services.improvement.diagnose()
+        _emit(report.model_dump(), args.output_format)
+        return
+
+    if args.command == "knowledge":
+        if args.knowledge_command == "reindex":
+            if args.control_plane_url.strip():
+                client = WorkerRuntimeClient(args.control_plane_url.strip())
+                payload = client.reindex_knowledge(KnowledgeReindexRequest(scope=args.scope))
+                _emit(payload["data"], args.output_format)
+                return
+            status = harness_lab_services.knowledge.reindex(scope=args.scope)
+            _emit(status.model_dump(), args.output_format)
+            return
+
+        if args.knowledge_command == "search":
+            request = KnowledgeSearchRequest(
+                query=args.query,
+                top_k=max(1, args.top_k),
+                path_hint=args.path_hint or None,
+                source_types=args.source_type,
+            )
+            if args.control_plane_url.strip():
+                client = WorkerRuntimeClient(args.control_plane_url.strip())
+                payload = client.search_knowledge(request)
+                _emit(payload["data"], args.output_format)
+                return
+            result = harness_lab_services.knowledge.search(
+                query=request.query,
+                top_k=request.top_k,
+                path_hint=request.path_hint,
+                source_types=request.source_types,
+            )
+            _emit(result.model_dump(), args.output_format)
+            return
 
     if args.command == "submit":
         context: dict[str, Any] = {}
@@ -173,11 +260,41 @@ def main() -> None:
             candidate_id=args.candidate_id or None,
             trace_refs=trace_refs,
         )
-        _emit(report.model_dump(), args.output_format)
+        payload = report.model_dump()
+        if args.output_format == "text":
+            payload = {
+                "evaluation_id": report.evaluation_id,
+                "suite": report.suite,
+                "status": report.status,
+                "handoff_success_rate": report.metrics.get("handoff_success_rate"),
+                "review_reject_rate": report.metrics.get("review_reject_rate"),
+                "repair_rate": report.metrics.get("repair_rate"),
+                "role_utilization": report.metrics.get("role_utilization"),
+                "cross_role_latency": report.metrics.get("cross_role_latency"),
+                "coverage_gaps": report.coverage_gaps,
+            }
+        _emit(payload, args.output_format)
         return
 
     if args.command == "candidates":
-        _emit([item.model_dump() for item in harness_lab_services.improvement.list_candidates()], args.output_format)
+        candidates = harness_lab_services.improvement.list_candidates()
+        if args.output_format == "text":
+            _emit(
+                [
+                    {
+                        "candidate_id": item.candidate_id,
+                        "kind": item.kind,
+                        "publish_status": item.publish_status,
+                        "eval_status": item.eval_status,
+                        "cluster_count": (((item.metrics or {}).get("diagnosis") or {}).get("cluster_count")),
+                        "proposal_summary": (item.metrics or {}).get("proposal_summary"),
+                    }
+                    for item in candidates
+                ],
+                args.output_format,
+            )
+            return
+        _emit([item.model_dump() for item in candidates], args.output_format)
         return
 
     if args.command == "promote":
@@ -218,12 +335,24 @@ def main() -> None:
 
     if args.command == "workers":
         if args.register:
+            sandbox_status = harness_lab_services.sandbox.status()
             worker = harness_lab_services.workers.register_worker(
-                WorkerRegisterRequest(label=args.label, capabilities=args.capability, version="v1")
+                WorkerRegisterRequest(
+                    label=args.label,
+                    capabilities=args.capability,
+                    role_profile=args.role_profile or None,
+                    sandbox_backend=sandbox_status.sandbox_backend,
+                    sandbox_ready=sandbox_status.docker_ready and sandbox_status.sandbox_image_ready,
+                    version="v1",
+                )
             )
             _emit(worker.model_dump(), args.output_format)
             return
         _emit([item.model_dump() for item in harness_lab_services.workers.list_workers()], args.output_format)
+        return
+
+    if args.command == "sandbox" and args.sandbox_command == "probe":
+        _emit(harness_lab_services.sandbox.status().model_dump(), args.output_format)
         return
 
     if args.command == "worker":
@@ -236,6 +365,7 @@ def main() -> None:
                     worker_id=args.worker_id or None,
                     label=args.label,
                     capabilities=args.capability,
+                    role_profile=args.role_profile or None,
                 )
                 _emit(worker.model_dump(), args.output_format)
                 return
@@ -244,6 +374,12 @@ def main() -> None:
                     worker_id=args.worker_id or None,
                     label=args.label,
                     capabilities=args.capability,
+                    role_profile=args.role_profile or None,
+                    sandbox_backend=harness_lab_services.sandbox.status().sandbox_backend,
+                    sandbox_ready=(
+                        harness_lab_services.sandbox.status().docker_ready
+                        and harness_lab_services.sandbox.status().sandbox_image_ready
+                    ),
                     version="v1",
                 )
             )
@@ -263,6 +399,10 @@ def main() -> None:
                     {
                         "worker": harness_lab_services.workers.get_worker(args.worker_id).model_dump(),
                         "health_summary": harness_lab_services.runtime.get_worker_health_summary(args.worker_id).model_dump(),
+                        "sandbox": {
+                            "backend": harness_lab_services.workers.get_worker(args.worker_id).sandbox_backend,
+                            "ready": harness_lab_services.workers.get_worker(args.worker_id).sandbox_ready,
+                        },
                         "recent_leases": [lease.model_dump() for lease in recent_leases],
                         "recent_events": [
                             event.model_dump()
@@ -277,6 +417,26 @@ def main() -> None:
             _emit([item.model_dump() for item in harness_lab_services.workers.list_workers()], args.output_format)
             return
 
+        if args.worker_command == "drain":
+            if args.control_plane_url.strip():
+                client = WorkerRuntimeClient(args.control_plane_url.strip())
+                worker = client.drain_worker(args.worker_id, args.reason or None)
+                _emit(worker.model_dump(), args.output_format)
+                return
+            worker = harness_lab_services.workers.drain_worker(args.worker_id, args.reason or None)
+            _emit(worker.model_dump(), args.output_format)
+            return
+
+        if args.worker_command == "resume":
+            if args.control_plane_url.strip():
+                client = WorkerRuntimeClient(args.control_plane_url.strip())
+                worker = client.resume_worker(args.worker_id)
+                _emit(worker.model_dump(), args.output_format)
+                return
+            worker = harness_lab_services.workers.resume_worker(args.worker_id)
+            _emit(worker.model_dump(), args.output_format)
+            return
+
         if args.worker_command == "serve":
             control_plane_url = args.control_plane_url.strip() or _default_control_plane_url()
             client = WorkerRuntimeClient(control_plane_url)
@@ -285,6 +445,7 @@ def main() -> None:
                 worker_id=args.worker_id or None,
                 label=args.label,
                 capabilities=args.capability,
+                role_profile=args.role_profile or None,
                 interval_seconds=max(0.1, args.interval),
                 once=args.once,
                 max_tasks=max(1, args.max_tasks),
@@ -308,6 +469,9 @@ def main() -> None:
                 "coordination_snapshot": harness_lab_services.runtime.run_coordination_snapshot(run_id).model_dump(),
                 "timeline_summary": harness_lab_services.runtime.run_timeline_summary(run_id),
                 "status_summary": harness_lab_services.runtime.run_status_summary(run_id),
+                "mission_phase": harness_lab_services.runtime.mission_phase_snapshot(run_id).model_dump(),
+                "latest_handoff": harness_lab_services.runtime.run_handoffs(run_id)[-1] if harness_lab_services.runtime.run_handoffs(run_id) else None,
+                "sandbox_summary": harness_lab_services.runtime.run_sandbox_summary(run_id),
                 "result": run.result,
             }
             _emit(payload, args.output_format)

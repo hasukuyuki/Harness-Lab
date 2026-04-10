@@ -5,6 +5,7 @@ import type {
   ContextAssembly,
   EvaluationReport,
   ExperimentRun,
+  FleetStatusReport,
   FailureCluster,
   HarnessPolicy,
   ImprovementCandidate,
@@ -18,6 +19,7 @@ import type {
   SessionDetail,
   SessionRequest,
   SettingsCatalog,
+  QueueShardStatus,
   ApprovalRequest,
   WorkerLease,
   WorkerSnapshot,
@@ -158,12 +160,28 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   listFailureClusters: async () => request<FailureCluster[]>('/api/failure-clusters'),
+  diagnoseImprovement: async (payload: { trace_refs?: string[] } = {}) =>
+    request<Record<string, unknown>>('/api/improvement/diagnose', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   listWorkers: async () => request<WorkerSnapshot[]>('/api/workers'),
+  fleetStatus: async () => request<FleetStatusReport>('/api/fleet/status'),
+  queueStatus: async () => request<QueueShardStatus[]>('/api/queues'),
   listLeases: async () => request<WorkerLease[]>('/api/leases'),
   registerWorker: async (payload: { label?: string; capabilities?: string[]; version?: string }) =>
     request<WorkerSnapshot>('/api/workers', {
       method: 'POST',
       body: JSON.stringify(payload),
+    }),
+  drainWorker: async (workerId: string, reason?: string) =>
+    request<WorkerSnapshot>(`/api/workers/${workerId}/drain`, {
+      method: 'POST',
+      body: JSON.stringify(reason ? { reason } : {}),
+    }),
+  resumeWorker: async (workerId: string) =>
+    request<WorkerSnapshot>(`/api/workers/${workerId}/resume`, {
+      method: 'POST',
     }),
   listApprovals: async () => request<ApprovalRequest[]>('/api/approvals'),
   resolveApproval: async (approvalId: string, decision: 'approve' | 'deny' | 'approve_once') =>

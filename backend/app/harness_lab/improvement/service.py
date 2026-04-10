@@ -12,10 +12,12 @@ from ..types import (
     EvaluationSuite,
     FailureCluster,
     HarnessPolicy,
+    ImprovementDiagnosisReport,
     ImprovementCandidate,
+    ResearchSession,
     PublishGateStatus,
     ResearchRun,
-    ResearchSession,
+    ReviewVerdict,
     WorkflowTemplateVersion,
 )
 from ..utils import compact_text, new_id, utc_now
@@ -87,6 +89,23 @@ class ImprovementService:
     def list_failure_clusters(self) -> List[FailureCluster]:
         return self.refresh_failure_clusters()
 
+    def diagnose(self, trace_refs: Optional[List[str]] = None) -> ImprovementDiagnosisReport:
+        runs = self._resolve_runs(trace_refs or [])
+        sessions = self._sessions_by_id()
+        clusters = sorted(self._build_failure_clusters(runs, sessions).values(), key=lambda item: item.frequency, reverse=True)
+        signature_counts: Dict[str, int] = {}
+        for cluster in clusters:
+            signature_counts[cluster.signature_type] = signature_counts.get(cluster.signature_type, 0) + cluster.frequency
+        top_blockers = [cluster.summary for cluster in clusters[:5]]
+        return ImprovementDiagnosisReport(
+            generated_at=utc_now(),
+            trace_refs=[run.run_id for run in runs],
+            cluster_count=len(clusters),
+            clusters=clusters,
+            top_blockers=top_blockers,
+            signature_counts=signature_counts,
+        )
+
     def create_policy_candidate(
         self,
         policy_id: Optional[str] = None,
@@ -94,7 +113,9 @@ class ImprovementService:
         rationale: Optional[str] = None,
     ) -> Dict[str, Any]:
         baseline = self._get_policy(policy_id or self._default_policy().policy_id)
-        observed = self._observe_runs(trace_refs or [])
+        runs = self._resolve_runs(trace_refs or [])
+        observed = self._observe_runs(trace_refs or [], runs=runs)
+        diagnosis = self.diagnose(trace_refs=[run.run_id for run in runs])
         proposed = baseline.model_copy(deep=True)
         proposed.policy_id = new_id("policy")
         proposed.name = f"{baseline.name} AutoTune"
@@ -105,11 +126,21 @@ class ImprovementService:
             **baseline.metrics,
             "source_success_rate": observed["success_rate"],
             "source_safety_score": observed["safety_score"],
+            "diagnosis_summary": self._diagnosis_summary(diagnosis),
+        }
+        proposed.tool_policy = {
+            **getattr(baseline, "tool_policy", {}),
+            **self._policy_tool_policy_adjustments(diagnosis),
+        }
+        proposed.model_routing = {
+            **getattr(baseline, "model_routing", {}),
+            **self._policy_model_routing_adjustments(diagnosis),
         }
         proposed.repair_policy = {
             **baseline.repair_policy,
-            "on_failure": "retry_with_reflection" if observed["failure_rate"] > 0 else baseline.repair_policy.get("on_failure", "trace_and_stop"),
-            "auto_recovery_budget": 2,
+            "on_failure": self._policy_on_failure(observed, diagnosis, baseline),
+            "auto_recovery_budget": 2 if observed["failure_rate"] > 0 else int(baseline.repair_policy.get("auto_recovery_budget", 1)),
+            "review_repair_mode": "research_then_retry" if self._has_cluster(diagnosis, "review_reject_loop") else baseline.repair_policy.get("review_repair_mode", "trace_and_stop"),
         }
         proposed.budget_policy = {
             **baseline.budget_policy,
@@ -119,6 +150,7 @@ class ImprovementService:
             "max_context_blocks": max(int(baseline.budget_policy.get("max_context_blocks", 8)), 10)
             if observed["approval_rate"] > 0.3
             else int(baseline.budget_policy.get("max_context_blocks", 8)),
+            "repair_loop_budget": 2 if self._has_cluster(diagnosis, "repair_path_failure") else int(baseline.budget_policy.get("repair_loop_budget", 1)),
         }
         self._persist_policy(proposed)
         candidate = ImprovementCandidate(
@@ -128,18 +160,33 @@ class ImprovementService:
             target_version_id=proposed.policy_id,
             baseline_version_id=baseline.policy_id,
             change_set=self._diff_policy(baseline, proposed),
-            rationale=rationale or self._policy_rationale(observed),
+            rationale=rationale or self._policy_rationale(observed, diagnosis),
             eval_status="pending",
             publish_status="draft",
             approved=True,
             requires_human_approval=False,
-            metrics={"observed": observed},
+            metrics={
+                "observed": observed,
+                "diagnosis": diagnosis.model_dump(),
+                "proposal_summary": self._policy_proposal_summary(diagnosis),
+                "trace_evidence": self._trace_evidence(diagnosis),
+            },
             evaluation_ids=[],
             created_at=utc_now(),
             updated_at=utc_now(),
         )
         self._persist_candidate(candidate)
-        return {"candidate": candidate, "version": proposed, "observations": observed}
+        evaluations = self._auto_evaluate_candidate(candidate.candidate_id, [run.run_id for run in runs])
+        candidate = self.get_candidate(candidate.candidate_id)
+        gate = self.get_candidate_gate(candidate.candidate_id)
+        return {
+            "candidate": candidate,
+            "version": proposed,
+            "observations": observed,
+            "diagnosis": diagnosis,
+            "evaluations": evaluations,
+            "gate": gate,
+        }
 
     def create_workflow_candidate(
         self,
@@ -148,7 +195,9 @@ class ImprovementService:
         rationale: Optional[str] = None,
     ) -> Dict[str, Any]:
         baseline = self.get_workflow(workflow_id or self.default_workflow().workflow_id)
-        observed = self._observe_runs(trace_refs or [])
+        runs = self._resolve_runs(trace_refs or [])
+        observed = self._observe_runs(trace_refs or [], runs=runs)
+        diagnosis = self.diagnose(trace_refs=[run.run_id for run in runs])
         proposed = baseline.model_copy(deep=True)
         proposed.workflow_id = new_id("workflow")
         proposed.parent_id = baseline.workflow_id
@@ -160,21 +209,16 @@ class ImprovementService:
             **baseline.metrics,
             "source_failure_rate": observed["failure_rate"],
             "source_recovery_rate": observed["recovery_rate"],
+            "diagnosis_summary": self._diagnosis_summary(diagnosis),
         }
-        gates = list(proposed.gates)
-        if observed["failure_rate"] > 0:
-            gates.append({"kind": "retry_gate", "max_attempts": 2, "owner": "recovery"})
-        if observed["approval_rate"] > 0.3:
-            gates.append({"kind": "review_gate", "owner": "reviewer", "when": "high_risk"})
-        if observed["context_budget_hit_rate"] > 0:
-            gates.append({"kind": "context_guard", "owner": "planner", "action": "compress_and_retry"})
-        proposed.gates = gates
+        proposed.gates = self._workflow_gates_with_diagnosis(proposed.gates, observed, diagnosis)
         proposed.role_map = {
             **baseline.role_map,
             "recovery": "Investigates failed attempts and prepares safe retry packets.",
             "reviewer": "Validates high-risk actions before final promotion.",
+            "researcher": "Builds role-aware context and handoff packets before execution.",
         }
-        proposed.dag = self._workflow_dag_with_recovery(baseline.dag)
+        proposed.dag = self._workflow_dag_with_diagnosis(baseline.dag, diagnosis)
         self._persist_workflow(proposed)
         candidate = ImprovementCandidate(
             candidate_id=new_id("candidate"),
@@ -183,18 +227,33 @@ class ImprovementService:
             target_version_id=proposed.workflow_id,
             baseline_version_id=baseline.workflow_id,
             change_set=self._diff_workflow(baseline, proposed),
-            rationale=rationale or self._workflow_rationale(observed),
+            rationale=rationale or self._workflow_rationale(observed, diagnosis),
             eval_status="pending",
             publish_status="draft",
             approved=False,
             requires_human_approval=True,
-            metrics={"observed": observed},
+            metrics={
+                "observed": observed,
+                "diagnosis": diagnosis.model_dump(),
+                "proposal_summary": self._workflow_proposal_summary(diagnosis),
+                "trace_evidence": self._trace_evidence(diagnosis),
+            },
             evaluation_ids=[],
             created_at=utc_now(),
             updated_at=utc_now(),
         )
         self._persist_candidate(candidate)
-        return {"candidate": candidate, "version": proposed, "observations": observed}
+        evaluations = self._auto_evaluate_candidate(candidate.candidate_id, [run.run_id for run in runs])
+        candidate = self.get_candidate(candidate.candidate_id)
+        gate = self.get_candidate_gate(candidate.candidate_id)
+        return {
+            "candidate": candidate,
+            "version": proposed,
+            "observations": observed,
+            "diagnosis": diagnosis,
+            "evaluations": evaluations,
+            "gate": gate,
+        }
 
     def evaluate_candidate(
         self,
@@ -309,35 +368,7 @@ class ImprovementService:
     def refresh_failure_clusters(self) -> List[FailureCluster]:
         runs = self._list_runs()
         sessions = self._sessions_by_id()
-        clusters: Dict[str, FailureCluster] = {}
-        now = utc_now()
-        for run in runs:
-            signature = self._cluster_signature(run)
-            if not signature:
-                continue
-            session = sessions.get(run.session_id)
-            cluster_id = self._cluster_id(signature)
-            if cluster_id not in clusters:
-                clusters[cluster_id] = FailureCluster(
-                    cluster_id=cluster_id,
-                    signature=signature,
-                    frequency=0,
-                    affected_policies=[],
-                    affected_workflows=[],
-                    sample_run_ids=[],
-                    summary=compact_text(signature, 180),
-                    created_at=now,
-                    updated_at=now,
-                )
-            cluster = clusters[cluster_id]
-            cluster.frequency += 1
-            cluster.updated_at = now
-            if len(cluster.sample_run_ids) < 5:
-                cluster.sample_run_ids.append(run.run_id)
-            if session and session.active_policy_id not in cluster.affected_policies:
-                cluster.affected_policies.append(session.active_policy_id)
-            if session and session.workflow_template_id and session.workflow_template_id not in cluster.affected_workflows:
-                cluster.affected_workflows.append(session.workflow_template_id)
+        clusters = self._build_failure_clusters(runs, sessions)
         for cluster in clusters.values():
             self.database.upsert_row(
                 "failure_clusters",
@@ -469,20 +500,69 @@ class ImprovementService:
             "scenarios": scenarios,
         }
 
-    def _cluster_signature(self, run: ResearchRun) -> Optional[str]:
-        if run.status == "awaiting_approval":
-            return "approval_required"
-        if run.execution_trace and run.execution_trace.recovery_events:
-            event = run.execution_trace.recovery_events[0]
-            return f"{event.kind}:{compact_text(event.summary, 100)}"
-        if run.execution_trace:
-            denied = [item for item in run.execution_trace.policy_verdicts if item.decision == "deny"]
-            if denied:
-                verdict = denied[0]
-                return f"policy:{verdict.matched_rule}"
-        if run.status == "failed":
-            return str(run.result.get("reason") or "failed_without_reason")
-        return None
+    def _build_failure_clusters(
+        self,
+        runs: List[ResearchRun],
+        sessions: Dict[str, ResearchSession],
+    ) -> Dict[str, FailureCluster]:
+        clusters: Dict[str, FailureCluster] = {}
+        now = utc_now()
+        for run in runs:
+            session = sessions.get(run.session_id)
+            for descriptor in self._cluster_descriptors(run):
+                signature = descriptor["signature"]
+                cluster_id = self._cluster_id(signature)
+                if cluster_id not in clusters:
+                    clusters[cluster_id] = FailureCluster(
+                        cluster_id=cluster_id,
+                        signature=signature,
+                        signature_type=descriptor["signature_type"],
+                        frequency=0,
+                        affected_policies=[],
+                        affected_workflows=[],
+                        sample_run_ids=[],
+                        sample_task_node_ids=[],
+                        roles=[],
+                        handoff_pairs=[],
+                        review_decisions=[],
+                        tool_names=[],
+                        policy_decisions=[],
+                        sandbox_outcomes=[],
+                        summary=descriptor["summary"],
+                        created_at=now,
+                        updated_at=now,
+                    )
+                cluster = clusters[cluster_id]
+                cluster.frequency += 1
+                cluster.updated_at = now
+                if len(cluster.sample_run_ids) < 5 and run.run_id not in cluster.sample_run_ids:
+                    cluster.sample_run_ids.append(run.run_id)
+                for task_node_id in descriptor["task_node_ids"]:
+                    if len(cluster.sample_task_node_ids) < 8 and task_node_id not in cluster.sample_task_node_ids:
+                        cluster.sample_task_node_ids.append(task_node_id)
+                for role in descriptor["roles"]:
+                    if role and role not in cluster.roles:
+                        cluster.roles.append(role)
+                for handoff_pair in descriptor["handoff_pairs"]:
+                    if handoff_pair and handoff_pair not in cluster.handoff_pairs:
+                        cluster.handoff_pairs.append(handoff_pair)
+                for review_decision in descriptor["review_decisions"]:
+                    if review_decision and review_decision not in cluster.review_decisions:
+                        cluster.review_decisions.append(review_decision)
+                for tool_name in descriptor["tool_names"]:
+                    if tool_name and tool_name not in cluster.tool_names:
+                        cluster.tool_names.append(tool_name)
+                for policy_decision in descriptor["policy_decisions"]:
+                    if policy_decision and policy_decision not in cluster.policy_decisions:
+                        cluster.policy_decisions.append(policy_decision)
+                for sandbox_outcome in descriptor["sandbox_outcomes"]:
+                    if sandbox_outcome and sandbox_outcome not in cluster.sandbox_outcomes:
+                        cluster.sandbox_outcomes.append(sandbox_outcome)
+                if session and session.active_policy_id not in cluster.affected_policies:
+                    cluster.affected_policies.append(session.active_policy_id)
+                if session and session.workflow_template_id and session.workflow_template_id not in cluster.affected_workflows:
+                    cluster.affected_workflows.append(session.workflow_template_id)
+        return clusters
 
     @staticmethod
     def _cluster_id(signature: str) -> str:
@@ -600,7 +680,7 @@ class ImprovementService:
     @staticmethod
     def _diff_policy(left: HarnessPolicy, right: HarnessPolicy) -> Dict[str, Any]:
         diff: Dict[str, Any] = {}
-        for field in ["repair_policy", "budget_policy", "metrics"]:
+        for field in ["tool_policy", "model_routing", "repair_policy", "budget_policy", "metrics"]:
             left_value = getattr(left, field)
             right_value = getattr(right, field)
             if left_value != right_value:
@@ -618,19 +698,19 @@ class ImprovementService:
         return diff
 
     @staticmethod
-    def _policy_rationale(observed: Dict[str, Any]) -> str:
+    def _policy_rationale(observed: Dict[str, Any], diagnosis: ImprovementDiagnosisReport) -> str:
         return (
-            "Observed replay traces suggest policy tuning can improve success rate and safety. "
+            "Observed multi-agent traces suggest policy tuning can improve success rate, review quality, and safety. "
             f"success_rate={observed['success_rate']} approval_rate={observed['approval_rate']} "
-            f"context_budget_hit_rate={observed['context_budget_hit_rate']}."
+            f"context_budget_hit_rate={observed['context_budget_hit_rate']} blockers={', '.join(diagnosis.top_blockers[:2]) or 'none'}."
         )
 
     @staticmethod
-    def _workflow_rationale(observed: Dict[str, Any]) -> str:
+    def _workflow_rationale(observed: Dict[str, Any], diagnosis: ImprovementDiagnosisReport) -> str:
         return (
-            "Observed run failures suggest workflow gating and recovery routing need adjustment. "
+            "Observed multi-agent traces suggest workflow gating, handoff routing, and repair flow need adjustment. "
             f"failure_rate={observed['failure_rate']} recovery_rate={observed['recovery_rate']} "
-            f"approval_rate={observed['approval_rate']}."
+            f"approval_rate={observed['approval_rate']} blockers={', '.join(diagnosis.top_blockers[:2]) or 'none'}."
         )
 
     @staticmethod
@@ -652,3 +732,272 @@ class ImprovementService:
         if not any(edge.get("source") == "recovery" and edge.get("target") == "review" for edge in edges):
             edges.append({"source": "recovery", "target": "review", "kind": "handoff"})
         return {"nodes": nodes, "edges": edges}
+
+    def _cluster_descriptors(self, run: ResearchRun) -> List[Dict[str, Any]]:
+        mission_phase = str(run.result.get("mission_phase", {}).get("phase") or "unknown")
+        handoffs = run.result.get("handoffs", [])
+        review_verdicts = run.result.get("review_verdicts", [])
+        latest_handoff = handoffs[-1] if handoffs else {}
+        latest_review = review_verdicts[-1] if review_verdicts else {}
+        tool_name = ""
+        if run.execution_trace and run.execution_trace.tool_calls:
+            tool_name = run.execution_trace.tool_calls[-1].tool_name
+        policy_decision = ""
+        if run.execution_trace and run.execution_trace.policy_verdicts:
+            policy_decision = run.execution_trace.policy_verdicts[-1].decision
+        sandbox_outcomes = self._sandbox_outcomes(run)
+        descriptors: List[Dict[str, Any]] = []
+
+        if handoffs and run.status in {"failed", "queued", "running", "recovering"}:
+            descriptors.append(
+                self._descriptor(
+                    signature_type="handoff_breakdown",
+                    mission_phase=mission_phase,
+                    roles=[latest_handoff.get("from_role"), latest_handoff.get("to_role")],
+                    handoff_pairs=[self._handoff_pair(latest_handoff)],
+                    review_decisions=[latest_review.get("decision")],
+                    tool_names=[tool_name],
+                    policy_decisions=[policy_decision],
+                    sandbox_outcomes=sandbox_outcomes,
+                    task_node_ids=[latest_handoff.get("task_node_id")],
+                    summary=f"Handoff chain stalled or failed during {mission_phase}.",
+                )
+            )
+        if any(verdict.get("decision") == "request_repair" for verdict in review_verdicts):
+            repair_verdicts = [verdict for verdict in review_verdicts if verdict.get("decision") == "request_repair"]
+            descriptors.append(
+                self._descriptor(
+                    signature_type="review_reject_loop",
+                    mission_phase=mission_phase,
+                    roles=[verdict.get("role") for verdict in repair_verdicts],
+                    handoff_pairs=[self._handoff_pair(packet) for packet in handoffs[-2:]],
+                    review_decisions=[verdict.get("decision") for verdict in repair_verdicts],
+                    tool_names=[tool_name],
+                    policy_decisions=[policy_decision],
+                    sandbox_outcomes=sandbox_outcomes,
+                    task_node_ids=[verdict.get("task_node_id") for verdict in repair_verdicts],
+                    summary="Reviewer requested repair, indicating the mission loop is rejecting output.",
+                )
+            )
+        if run.execution_trace and run.execution_trace.recovery_events and run.status in {"failed", "recovering", "queued"}:
+            descriptors.append(
+                self._descriptor(
+                    signature_type="repair_path_failure",
+                    mission_phase=mission_phase,
+                    roles=[latest_handoff.get("to_role"), "recovery"],
+                    handoff_pairs=[self._handoff_pair(latest_handoff)],
+                    review_decisions=[latest_review.get("decision")],
+                    tool_names=[tool_name],
+                    policy_decisions=[policy_decision],
+                    sandbox_outcomes=sandbox_outcomes,
+                    task_node_ids=[latest_handoff.get("task_node_id")],
+                    summary=compact_text(run.execution_trace.recovery_events[-1].summary, 180),
+                )
+            )
+        approvals = self.database.list_approvals(run_id=run.run_id)
+        if approvals and (sandbox_outcomes or run.status == "awaiting_approval"):
+            descriptors.append(
+                self._descriptor(
+                    signature_type="approval_sandbox_friction",
+                    mission_phase=mission_phase,
+                    roles=[latest_handoff.get("to_role"), latest_review.get("role")],
+                    handoff_pairs=[self._handoff_pair(latest_handoff)],
+                    review_decisions=[latest_review.get("decision")],
+                    tool_names=[tool_name],
+                    policy_decisions=[policy_decision],
+                    sandbox_outcomes=sandbox_outcomes or [approvals[-1].status],
+                    task_node_ids=[latest_handoff.get("task_node_id")],
+                    summary="Approval or sandbox friction is slowing down or blocking high-risk execution.",
+                )
+            )
+        if run.status in {"queued", "running"} and handoffs and not self._has_active_execution_evidence(run):
+            descriptors.append(
+                self._descriptor(
+                    signature_type="role_mismatch_or_starvation",
+                    mission_phase=mission_phase,
+                    roles=[packet.get("to_role") for packet in handoffs[-2:]],
+                    handoff_pairs=[self._handoff_pair(packet) for packet in handoffs[-2:]],
+                    review_decisions=[latest_review.get("decision")],
+                    tool_names=[tool_name],
+                    policy_decisions=[policy_decision],
+                    sandbox_outcomes=sandbox_outcomes,
+                    task_node_ids=[packet.get("task_node_id") for packet in handoffs[-2:]],
+                    summary="A role handoff is ready but no compatible worker or follow-up execution arrived.",
+                )
+            )
+        return descriptors
+
+    def _descriptor(
+        self,
+        *,
+        signature_type: str,
+        mission_phase: str,
+        roles: List[Any],
+        handoff_pairs: List[Any],
+        review_decisions: List[Any],
+        tool_names: List[Any],
+        policy_decisions: List[Any],
+        sandbox_outcomes: List[Any],
+        task_node_ids: List[Any],
+        summary: str,
+    ) -> Dict[str, Any]:
+        role_values = [value for value in roles if value]
+        handoff_values = [value for value in handoff_pairs if value]
+        review_values = [value for value in review_decisions if value]
+        tool_values = [value for value in tool_names if value]
+        policy_values = [value for value in policy_decisions if value]
+        sandbox_values = [value for value in sandbox_outcomes if value]
+        task_values = [value for value in task_node_ids if value]
+        signature = (
+            f"{signature_type}|phase={mission_phase}|roles={','.join(role_values) or 'none'}|"
+            f"handoff={','.join(handoff_values) or 'none'}|review={','.join(review_values) or 'none'}|"
+            f"tool={','.join(tool_values) or 'none'}|policy={','.join(policy_values) or 'none'}|"
+            f"sandbox={','.join(sandbox_values) or 'none'}"
+        )
+        return {
+            "signature": signature,
+            "signature_type": signature_type,
+            "roles": role_values,
+            "handoff_pairs": handoff_values,
+            "review_decisions": review_values,
+            "tool_names": tool_values,
+            "policy_decisions": policy_values,
+            "sandbox_outcomes": sandbox_values,
+            "task_node_ids": task_values,
+            "summary": compact_text(summary, 180),
+        }
+
+    def _auto_evaluate_candidate(self, candidate_id: str, trace_refs: List[str]) -> List[EvaluationReport]:
+        reports = [
+            self.evaluate_candidate("replay", candidate_id=candidate_id, trace_refs=trace_refs),
+            self.evaluate_candidate("benchmark", candidate_id=candidate_id, trace_refs=trace_refs),
+        ]
+        return reports
+
+    @staticmethod
+    def _handoff_pair(packet: Dict[str, Any]) -> Optional[str]:
+        from_role = packet.get("from_role")
+        to_role = packet.get("to_role")
+        if not from_role or not to_role:
+            return None
+        return f"{from_role}->{to_role}"
+
+    def _sandbox_outcomes(self, run: ResearchRun) -> List[str]:
+        outcomes: List[str] = []
+        for event in self.database.list_events(run_id=run.run_id, limit=500):
+            if event.event_type == "sandbox.failed":
+                outcomes.append("failed")
+            elif event.event_type == "sandbox.executed":
+                outcomes.append("executed")
+        return outcomes
+
+    def _has_active_execution_evidence(self, run: ResearchRun) -> bool:
+        events = self.database.list_events(run_id=run.run_id, limit=500)
+        return any(event.event_type in {"lease.created", "lease.completed", "lease.failed"} for event in events)
+
+    @staticmethod
+    def _diagnosis_summary(diagnosis: ImprovementDiagnosisReport) -> Dict[str, Any]:
+        return {
+            "cluster_count": diagnosis.cluster_count,
+            "top_blockers": diagnosis.top_blockers[:3],
+            "signature_counts": diagnosis.signature_counts,
+        }
+
+    @staticmethod
+    def _trace_evidence(diagnosis: ImprovementDiagnosisReport) -> List[Dict[str, Any]]:
+        return [
+            {
+                "cluster_id": cluster.cluster_id,
+                "signature_type": cluster.signature_type,
+                "sample_run_ids": cluster.sample_run_ids,
+                "sample_task_node_ids": cluster.sample_task_node_ids,
+            }
+            for cluster in diagnosis.clusters[:5]
+        ]
+
+    @staticmethod
+    def _has_cluster(diagnosis: ImprovementDiagnosisReport, signature_type: str) -> bool:
+        return any(cluster.signature_type == signature_type for cluster in diagnosis.clusters)
+
+    @staticmethod
+    def _policy_proposal_summary(diagnosis: ImprovementDiagnosisReport) -> str:
+        if not diagnosis.clusters:
+            return "No strong multi-agent blockers were detected; keeping policy changes conservative."
+        dominant = diagnosis.clusters[0]
+        return f"Policy proposal targets {dominant.signature_type} using trace-backed safety and repair tuning."
+
+    @staticmethod
+    def _workflow_proposal_summary(diagnosis: ImprovementDiagnosisReport) -> str:
+        if not diagnosis.clusters:
+            return "No strong workflow blocker was detected; keeping DAG changes conservative."
+        dominant = diagnosis.clusters[0]
+        return f"Workflow proposal targets {dominant.signature_type} by tightening handoff and review routing."
+
+    @staticmethod
+    def _policy_tool_policy_adjustments(diagnosis: ImprovementDiagnosisReport) -> Dict[str, Any]:
+        if any(cluster.signature_type == "approval_sandbox_friction" for cluster in diagnosis.clusters):
+            return {"high_risk_requires_review": True, "prefer_sandboxed_execution": True}
+        return {}
+
+    @staticmethod
+    def _policy_model_routing_adjustments(diagnosis: ImprovementDiagnosisReport) -> Dict[str, Any]:
+        if any(cluster.signature_type in {"handoff_breakdown", "review_reject_loop"} for cluster in diagnosis.clusters):
+            return {"reviewer_mode": "reflection_first", "researcher_mode": "context_heavy"}
+        return {}
+
+    def _policy_on_failure(
+        self,
+        observed: Dict[str, Any],
+        diagnosis: ImprovementDiagnosisReport,
+        baseline: HarnessPolicy,
+    ) -> str:
+        if self._has_cluster(diagnosis, "review_reject_loop"):
+            return "retry_with_research_handoff"
+        if self._has_cluster(diagnosis, "repair_path_failure") or observed["failure_rate"] > 0:
+            return "retry_with_reflection"
+        return str(baseline.repair_policy.get("on_failure", "trace_and_stop"))
+
+    def _workflow_gates_with_diagnosis(
+        self,
+        gates: List[Dict[str, Any]],
+        observed: Dict[str, Any],
+        diagnosis: ImprovementDiagnosisReport,
+    ) -> List[Dict[str, Any]]:
+        updated = list(gates)
+        if observed["failure_rate"] > 0 or self._has_cluster(diagnosis, "repair_path_failure"):
+            updated.append({"kind": "retry_gate", "max_attempts": 2, "owner": "recovery"})
+        if observed["approval_rate"] > 0.3 or self._has_cluster(diagnosis, "approval_sandbox_friction"):
+            updated.append({"kind": "review_gate", "owner": "reviewer", "when": "high_risk"})
+        if observed["context_budget_hit_rate"] > 0:
+            updated.append({"kind": "context_guard", "owner": "planner", "action": "compress_and_retry"})
+        if self._has_cluster(diagnosis, "handoff_breakdown"):
+            updated.append({"kind": "handoff_guard", "owner": "reviewer", "action": "require_handoff_packet"})
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for gate in updated:
+            gate_key = json.dumps(gate, sort_keys=True, ensure_ascii=False)
+            if gate_key in seen:
+                continue
+            seen.add(gate_key)
+            deduped.append(gate)
+        return deduped
+
+    def _workflow_dag_with_diagnosis(
+        self,
+        dag: Dict[str, Any],
+        diagnosis: ImprovementDiagnosisReport,
+    ) -> Dict[str, Any]:
+        updated = self._workflow_dag_with_recovery(dag)
+        edges = list(updated.get("edges", []))
+        if self._has_cluster(diagnosis, "handoff_breakdown"):
+            for edge in edges:
+                if edge.get("source") == "execute" and edge.get("target") == "review":
+                    edge["kind"] = "handoff"
+                if edge.get("source") == "recovery" and edge.get("target") == "review":
+                    edge["kind"] = "handoff"
+        if self._has_cluster(diagnosis, "review_reject_loop") and not any(
+            edge.get("source") == "review" and edge.get("target") == "recovery" for edge in edges
+        ):
+            edges.append({"source": "review", "target": "recovery", "kind": "handoff"})
+        updated["edges"] = edges
+        return updated

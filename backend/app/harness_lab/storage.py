@@ -10,8 +10,9 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 import psycopg
 from psycopg.rows import dict_row
 
+from .artifact_store import ArtifactStore, LocalFilesystemArtifactStore
 from .types import ApprovalRequestModel, ArtifactRef, EventEnvelope, Mission, TaskAttempt, WorkerLease
-from .utils import ensure_parent, json_dumps, new_id, utc_now
+from .utils import json_dumps, new_id, utc_now
 
 
 POSTGRES_SCHEMA_STATEMENTS = [
@@ -503,6 +504,7 @@ class PlatformStore(ABC):
         self.artifact_root = Path(artifact_root) if artifact_root else self.data_dir / "artifacts"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.artifact_root.mkdir(parents=True, exist_ok=True)
+        self.artifact_store: ArtifactStore = LocalFilesystemArtifactStore(self.artifact_root)
 
     @abstractmethod
     def ping(self) -> None:
@@ -629,35 +631,28 @@ class PlatformStore(ABC):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ArtifactRef:
-        artifact_id = new_id("artifact")
-        created_at = utc_now()
-        relative_path = Path(run_id) / artifact_type / filename
-        absolute_path = self.artifact_root / relative_path
-        ensure_parent(absolute_path)
-        absolute_path.write_text(content, encoding="utf-8")
-        payload = metadata or {}
+        artifact = self.artifact_store.write_text(
+            run_id=run_id,
+            artifact_type=artifact_type,
+            filename=filename,
+            content=content,
+            metadata=metadata,
+        )
         self.execute(
             """
             INSERT INTO artifacts (artifact_id, run_id, artifact_type, relative_path, payload_json, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                artifact_id,
-                run_id,
-                artifact_type,
-                str(relative_path),
-                json_dumps(payload),
-                created_at,
+                artifact.artifact_id,
+                artifact.run_id,
+                artifact.artifact_type,
+                artifact.relative_path,
+                json_dumps(artifact.metadata),
+                artifact.created_at,
             ),
         )
-        return ArtifactRef(
-            artifact_id=artifact_id,
-            run_id=run_id,
-            artifact_type=artifact_type,
-            relative_path=str(relative_path),
-            metadata=payload,
-            created_at=created_at,
-        )
+        return artifact
 
     def list_artifacts(self, run_id: Optional[str] = None, conn: Any | None = None) -> List[ArtifactRef]:
         if run_id:

@@ -12,17 +12,20 @@ from ..prompting.assembler import PromptAssembler
 from ..storage import PlatformStore
 from ..types import (
     ApprovalRequestModel,
+    ActionPlan,
     ContextAssembleRequest,
     ContextProfile,
     EventEnvelope,
     ExecutionTrace,
     ExperimentRun,
     HarnessPolicy,
+    HandoffPacket,
     IntentDeclaration,
     IntentRequest,
     ModelProfile,
     ModelProviderSettings,
     Mission,
+    MissionPhaseSnapshot,
     PolicyVerdict,
     PromptFrame,
     PromptRenderRequest,
@@ -30,9 +33,11 @@ from ..types import (
     RecoveryEvent,
     ResearchRun,
     ResearchSession,
+    ReviewVerdict,
     RunRequest,
     SessionRequest,
     DispatchEnvelope,
+    DispatchConstraint,
     LeaseCompletionRequest,
     LeaseFailureRequest,
     LeaseReleaseRequest,
@@ -49,10 +54,12 @@ from ..types import (
     WorkflowTemplateVersion,
 )
 from ..utils import new_id, utc_now
-from ..workers.service import WorkerService
 from .models import ModelRegistry
 from ..orchestrator.service import OrchestratorService
-from .execution_plane import LeaseManager, LocalWorkerAdapter, RunCoordinator
+from .execution_plane import LocalWorkerAdapter, RunCoordinator
+from ..fleet import create_protocol_adapters
+from ..fleet.lease_manager import LeaseManager
+from ..fleet.worker_registry import WorkerRegistry
 
 
 class RuntimeService:
@@ -68,7 +75,6 @@ class RuntimeService:
         model_registry: ModelRegistry,
         orchestrator: OrchestratorService,
         prompt_assembler: PromptAssembler,
-        worker_service: WorkerService,
     ) -> None:
         self.database = database
         self.dispatch_queue = dispatch_queue
@@ -78,14 +84,31 @@ class RuntimeService:
         self.model_registry = model_registry
         self.orchestrator = orchestrator
         self.prompt_assembler = prompt_assembler
-        self.worker_service = worker_service
+        self.worker_registry = WorkerRegistry(database)
         self.lease_timeout_seconds = 30
         self.reclaimed_lease_count = 0
         self.last_lease_sweep_at: Optional[str] = None
         self.last_lease_sweep_report = LeaseSweepReport()
+        self.late_callback_count = 0
         self.run_coordinator = RunCoordinator(self)
-        self.lease_manager = LeaseManager(self)
         self.local_worker_adapter = LocalWorkerAdapter(self)
+        
+        # Create protocol adapters for LeaseManager
+        adapters = create_protocol_adapters(self)
+        
+        # Initialize LeaseManager with protocol dependencies
+        self.lease_manager = LeaseManager(
+            database=database,
+            coordination=adapters["coordination"],
+            constraints=adapters["constraints"],
+            context=adapters["context"],
+            execution=adapters["execution"],
+            utilities=adapters["utilities"],
+            worker_registry=self.worker_registry,
+            dispatch_queue=dispatch_queue,
+            orchestrator=orchestrator,
+            lease_timeout_seconds=self.lease_timeout_seconds,
+        )
 
     def list_sessions(self, limit: int = 50) -> List[ResearchSession]:
         rows = self.database.fetchall("SELECT payload_json FROM sessions ORDER BY created_at DESC LIMIT ?", (limit,))
@@ -251,6 +274,20 @@ class RuntimeService:
                 {"template_id": prompt_frame.template_id},
             ),
         ]
+        knowledge_summary = summary.get("knowledge_search")
+        if knowledge_summary:
+            knowledge_artifact = self.database.write_artifact_text(
+                run_id,
+                "knowledge_search_results",
+                "knowledge_search_results.json",
+                json.dumps(knowledge_summary, ensure_ascii=False, indent=2),
+                {
+                    "query": knowledge_summary.get("query"),
+                    "used_fallback": knowledge_summary.get("used_fallback"),
+                    "source_coverage": knowledge_summary.get("source_coverage", {}),
+                },
+            )
+            artifacts.append(knowledge_artifact)
         trace = ExecutionTrace(
             trace_id=new_id("trace"),
             session_id=session.session_id,
@@ -301,6 +338,18 @@ class RuntimeService:
                 run_id=run_id,
             )
         self.database.append_event("context.assembled", summary, session_id=session.session_id, run_id=run_id)
+        if knowledge_summary:
+            self.database.append_event(
+                "knowledge.search.selected",
+                {
+                    "query": knowledge_summary.get("query"),
+                    "used_fallback": knowledge_summary.get("used_fallback"),
+                    "source_coverage": knowledge_summary.get("source_coverage", {}),
+                    "hit_count": len(knowledge_summary.get("hits", [])),
+                },
+                session_id=session.session_id,
+                run_id=run_id,
+            )
         self.database.append_event(
             "prompt.rendered",
             {"prompt_frame_id": prompt_frame.prompt_frame_id, "total_token_estimate": prompt_frame.total_token_estimate},
@@ -461,6 +510,15 @@ class RuntimeService:
     def execution_plane_status(self) -> Dict[str, Any]:
         return self.lease_manager.execution_plane_status()
 
+    def fleet_status(self):
+        return self.lease_manager.fleet_status()
+
+    def queue_status(self):
+        return self.lease_manager.queue_status()
+
+    def sandbox_status(self):
+        return self.tool_gateway.sandbox_status()
+
     def run_coordination_snapshot(self, run_id: str):
         run = self.get_run(run_id)
         session = self.get_session(run.session_id)
@@ -473,6 +531,92 @@ class RuntimeService:
         run = self.get_run(run_id)
         session = self.get_session(run.session_id)
         return self.lease_manager.run_status_summary(run, session)
+
+    def mission_phase_snapshot(self, run_id: str) -> MissionPhaseSnapshot:
+        run = self.get_run(run_id)
+        session = self.get_session(run.session_id)
+        task_graph = self._task_graph(session)
+        active_nodes = [node for node in task_graph.nodes if node.status in {"planned", "ready", "leased", "running", "blocked"}]
+        active_roles = list(dict.fromkeys(node.agent_role for node in active_nodes))
+        if run.status in {"completed", "failed", "cancelled"}:
+            phase = "mission_completion"
+        elif any(node.kind in {"planning", "prompt"} and node.status in {"planned", "ready", "leased", "running"} for node in task_graph.nodes):
+            phase = "mission_planning"
+        elif any(node.kind == "context" and node.status in {"planned", "ready", "leased", "running"} for node in task_graph.nodes):
+            phase = "task_decomposition"
+        elif any(node.kind == "execution" and node.status in {"planned", "ready", "leased", "running"} for node in task_graph.nodes):
+            phase = "wave_dispatch"
+        elif any(node.kind in {"policy", "review"} and node.status in {"planned", "ready", "leased", "running", "blocked"} for node in task_graph.nodes):
+            phase = "handoff_review"
+        else:
+            phase = "role_assignment"
+        pending_handoffs = [
+            packet["id"]
+            for packet in self.run_handoffs(run_id)
+            if self._task_node_by_id(task_graph, packet["task_node_id"]).status not in {"completed", "skipped"}
+        ]
+        return MissionPhaseSnapshot(
+            run_id=run_id,
+            phase=phase,
+            active_roles=active_roles,
+            pending_handoffs=pending_handoffs,
+            updated_at=utc_now(),
+        )
+
+    def run_handoffs(self, run_id: str) -> List[Dict[str, Any]]:
+        run = self.get_run(run_id)
+        return list(run.result.get("handoffs", []))
+
+    def run_review_verdicts(self, run_id: str) -> List[Dict[str, Any]]:
+        run = self.get_run(run_id)
+        return list(run.result.get("review_verdicts", []))
+
+    def run_role_timeline(self, run_id: str) -> List[Dict[str, Any]]:
+        run = self.get_run(run_id)
+        session = self.get_session(run.session_id)
+        nodes = {node.node_id: node for node in self._task_graph(session).nodes}
+        timeline: List[Dict[str, Any]] = []
+        for event in self.list_events(run_id=run_id, limit=500):
+            if event.event_type not in {"task.started", "task.completed", "task.failed", "task.blocked"}:
+                continue
+            node = nodes.get(str(event.payload.get("node_id")))
+            timeline.append(
+                {
+                    "event_type": event.event_type,
+                    "node_id": event.payload.get("node_id"),
+                    "label": event.payload.get("label"),
+                    "agent_role": node.agent_role if node else event.payload.get("role"),
+                    "worker_id": event.payload.get("worker_id"),
+                    "created_at": event.created_at,
+                }
+            )
+        return timeline
+
+    def run_sandbox_summary(self, run_id: str) -> Dict[str, Any]:
+        run = self.get_run(run_id)
+        sandboxed_calls = []
+        changed_paths: List[str] = []
+        for call in run.execution_trace.tool_calls:
+            trace = call.output.get("sandbox_trace") if call.output else None
+            if not isinstance(trace, dict):
+                continue
+            sandboxed_calls.append(
+                {
+                    "tool_name": call.tool_name,
+                    "ok": call.ok,
+                    "changed_paths": call.output.get("changed_paths", []),
+                    "sandbox_trace": trace,
+                }
+            )
+            for path in call.output.get("changed_paths", []):
+                if path not in changed_paths:
+                    changed_paths.append(path)
+        return {
+            "sandboxed_call_count": len(sandboxed_calls),
+            "sandbox_failure_count": len([item for item in sandboxed_calls if not item["ok"]]),
+            "changed_paths": changed_paths,
+            "latest_calls": sandboxed_calls[-5:],
+        }
 
     def get_worker_health_summary(self, worker_id: str):
         return self.lease_manager.worker_health_summary(worker_id)
@@ -612,12 +756,116 @@ class RuntimeService:
         return self.run_coordinator.mark_ready_nodes(session, run_id)
 
     def _worker_matches_node(self, worker, session: ResearchSession, node: TaskNode) -> bool:
-        if not worker.capabilities:
-            return True
-        required = None
+        if getattr(worker, "drain_state", "active") == "draining":
+            return False
+        constraints = self._dispatch_constraint_for_node(session, node)
+        if getattr(worker, "role_profile", None) and worker.role_profile != node.agent_role:
+            return False
+        if constraints.execution_mode and getattr(worker, "execution_mode", None) not in {constraints.execution_mode, "embedded"}:
+            return False
+        if constraints.requires_sandbox and not getattr(worker, "sandbox_ready", False):
+            return False
+        worker_labels = set(getattr(worker, "labels", []) or [])
+        if any(label not in worker_labels for label in constraints.required_labels):
+            return False
+        if constraints.required_capabilities and any(capability not in (worker.capabilities or []) for capability in constraints.required_capabilities):
+            return False
+        return True
+
+    def _dispatch_constraint_for_node(self, session: ResearchSession, node: TaskNode) -> DispatchConstraint:
+        metadata = node.metadata or {}
+        required_capabilities: List[str] = []
         if node.kind == "execution":
-            required = session.intent_declaration.suggested_action.tool_name
-        return required is None or required in worker.capabilities
+            required_capabilities = [session.intent_declaration.suggested_action.tool_name]
+        tool_name = required_capabilities[0] if required_capabilities else None
+        risk_level = self._tool_risk_level(tool_name) if tool_name else "low"
+        required_labels = [str(item) for item in metadata.get("required_labels", [])]
+        preferred_labels = [str(item) for item in metadata.get("preferred_labels", [])]
+        if tool_name == "knowledge_search":
+            preferred_labels = list(dict.fromkeys([*preferred_labels, "knowledge"]))
+        if node.agent_role == "executor" and risk_level in {"medium", "high"}:
+            preferred_labels = list(dict.fromkeys([*preferred_labels, "executor"]))
+        if node.agent_role == "researcher":
+            preferred_labels = list(dict.fromkeys([*preferred_labels, "research"]))
+        requires_sandbox = self.tool_gateway.requires_sandbox(session.intent_declaration.suggested_action) if node.kind == "execution" else False
+        queue_parts = [node.agent_role, risk_level]
+        queue_parts.extend(required_labels or ["unlabeled"])
+        return DispatchConstraint(
+            agent_role=node.agent_role,
+            required_capabilities=required_capabilities,
+            required_labels=required_labels,
+            preferred_labels=preferred_labels,
+            execution_mode="remote_http" if session.execution_mode == "remote_worker" else None,
+            requires_sandbox=requires_sandbox,
+            risk_level=risk_level,
+            queue_shard="/".join(queue_parts),
+        )
+
+    def _worker_sort_key(self, worker, session: ResearchSession, node: TaskNode) -> tuple[int, int, str]:
+        constraints = self._dispatch_constraint_for_node(session, node)
+        preferred_hits = sum(1 for label in constraints.preferred_labels if label in (worker.labels or []))
+        current_load = int(getattr(worker, "lease_count", 0) or 0)
+        return (-preferred_hits, current_load, worker.worker_id)
+
+    def _dispatch_blockers_for_run(self, run: ResearchRun, session: ResearchSession) -> List[Dict[str, Any]]:
+        task_graph = self._task_graph(session)
+        ready_nodes = [node for node in task_graph.nodes if node.status == "ready"]
+        if not ready_nodes:
+            return []
+        workers = self.worker_registry.list_workers()
+        blockers: List[Dict[str, Any]] = []
+        for node in ready_nodes:
+            constraints = self._dispatch_constraint_for_node(session, node)
+            role_workers = [worker for worker in workers if not worker.role_profile or worker.role_profile == node.agent_role]
+            matching_workers = [worker for worker in workers if self._worker_matches_node(worker, session, node)]
+            blocker = None
+            if not role_workers:
+                blocker = {
+                    "task_node_id": node.node_id,
+                    "kind": "no_role_worker",
+                    "agent_role": node.agent_role,
+                    "required_labels": constraints.required_labels,
+                    "required_capabilities": constraints.required_capabilities,
+                }
+            elif constraints.requires_sandbox and not any(worker.sandbox_ready for worker in role_workers):
+                blocker = {
+                    "task_node_id": node.node_id,
+                    "kind": "awaiting_sandbox_ready_worker",
+                    "agent_role": node.agent_role,
+                    "required_labels": constraints.required_labels,
+                    "required_capabilities": constraints.required_capabilities,
+                }
+            elif constraints.required_labels and not any(
+                all(label in (worker.labels or []) for label in constraints.required_labels)
+                for worker in role_workers
+            ):
+                blocker = {
+                    "task_node_id": node.node_id,
+                    "kind": "awaiting_required_label",
+                    "agent_role": node.agent_role,
+                    "required_labels": constraints.required_labels,
+                    "required_capabilities": constraints.required_capabilities,
+                }
+            elif role_workers and not matching_workers and all(worker.drain_state == "draining" for worker in role_workers):
+                blocker = {
+                    "task_node_id": node.node_id,
+                    "kind": "all_matching_workers_draining",
+                    "agent_role": node.agent_role,
+                    "required_labels": constraints.required_labels,
+                    "required_capabilities": constraints.required_capabilities,
+                }
+            elif role_workers and not matching_workers:
+                blocker = {
+                    "task_node_id": node.node_id,
+                    "kind": "no_matching_worker",
+                    "agent_role": node.agent_role,
+                    "required_labels": constraints.required_labels,
+                    "required_capabilities": constraints.required_capabilities,
+                }
+            if blocker:
+                blocker["queue_shard"] = constraints.queue_shard
+                blockers.append(blocker)
+        return blockers
 
     def _approval_token_for_run(self, run_id: str) -> Optional[str]:
         approvals = self.database.list_approvals(run_id=run_id)
@@ -625,6 +873,125 @@ class RuntimeService:
             if approval.status == "approved":
                 return f"approval:{approval.approval_id}:{approval.decision}"
         return None
+
+    def _action_with_runtime_context(self, run: ResearchRun, action: ActionPlan) -> ActionPlan:
+        payload = dict(action.payload)
+        approval_token = self._approval_token_for_run(run.run_id)
+        if approval_token:
+            payload.setdefault("_approval_token", approval_token)
+        sandbox_spec = self.tool_gateway.sandbox_spec_for(action, approval_token=approval_token)
+        if sandbox_spec is not None:
+            payload.setdefault("_sandbox_spec", sandbox_spec.model_dump())
+        return action.model_copy(update={"payload": payload})
+
+    @staticmethod
+    def _result_list(run: ResearchRun, key: str) -> List[Dict[str, Any]]:
+        value = run.result.setdefault(key, [])
+        if isinstance(value, list):
+            return value
+        value = []
+        run.result[key] = value
+        return value
+
+    @staticmethod
+    def _merge_run_result(run: ResearchRun, payload: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(run.result or {})
+        merged.update(payload)
+        for preserved_key in ("handoffs", "review_verdicts"):
+            if preserved_key in run.result and preserved_key not in payload:
+                merged[preserved_key] = run.result[preserved_key]
+        run.result = merged
+        return merged
+
+    def _record_handoffs_for_node(self, run: ResearchRun, session: ResearchSession, node: TaskNode) -> List[HandoffPacket]:
+        if not session.task_graph:
+            return []
+        packets: List[HandoffPacket] = []
+        existing = self._result_list(run, "handoffs")
+        target_nodes = {item["task_node_id"] for item in existing if item.get("task_node_id")}
+        artifacts = [artifact.artifact_id for artifact in run.execution_trace.artifacts[-3:]] if run.execution_trace else []
+        context_refs = [ref for ref in [self._artifact_ref(run, "context_bundle"), self._artifact_ref(run, "prompt_frame")] if ref]
+        for edge in session.task_graph.edges:
+            if edge.source != node.node_id:
+                continue
+            target = self._task_node_by_id(session.task_graph, edge.target)
+            if target.agent_role == node.agent_role or target.node_id in target_nodes:
+                continue
+            packet = HandoffPacket(
+                id=new_id("handoff"),
+                from_role=node.agent_role,
+                to_role=target.agent_role,
+                mission_id=run.mission_id,
+                run_id=run.run_id,
+                task_node_id=target.node_id,
+                summary=f"{node.agent_role} handed off {node.label} to {target.agent_role} for {target.label}.",
+                artifacts=artifacts,
+                context_refs=context_refs,
+                required_action=target.kind,
+                open_questions=[run.result["reason"]] if run.result.get("reason") else [],
+                created_at=utc_now(),
+            )
+            artifact = self.database.write_artifact_text(
+                run.run_id,
+                "handoff_packet",
+                f"{packet.id}.json",
+                json.dumps(packet.model_dump(), ensure_ascii=False, indent=2),
+                {"from_role": packet.from_role, "to_role": packet.to_role, "task_node_id": packet.task_node_id},
+            )
+            if run.execution_trace:
+                run.execution_trace.artifacts.append(artifact)
+            node.metadata.setdefault("handoff_packet_ids", []).append(packet.id)
+            existing.append(packet.model_dump())
+            self.database.append_event(
+                "handoff.created",
+                {**packet.model_dump(), "artifact_id": artifact.artifact_id, "source_node_id": node.node_id},
+                session_id=session.session_id,
+                run_id=run.run_id,
+            )
+            packets.append(packet)
+        return packets
+
+    def _review_decision(self, run: ResearchRun, node: TaskNode, final_verdict: Optional[PolicyVerdict] = None) -> tuple[str, str, bool]:
+        if node.kind == "policy":
+            verdict = final_verdict or self._stored_final_verdict(run)
+            if verdict.decision in {"approval_required", "deny"}:
+                return "escalate", verdict.reason, False
+            return "accept", "Policy preflight accepted the mission for role handoff.", False
+        if run.execution_trace and run.execution_trace.recovery_events:
+            latest = run.execution_trace.recovery_events[-1]
+            return "request_repair", latest.summary, True
+        if self.run_handoffs(run.run_id):
+            return "complete", "Reviewer accepted the current handoff chain and mission output.", False
+        return "accept", "Reviewer accepted the current stage output.", False
+
+    def _record_review_verdict(
+        self,
+        run: ResearchRun,
+        session: ResearchSession,
+        node: TaskNode,
+        decision: str,
+        summary: str,
+        repair_requested: bool = False,
+    ) -> ReviewVerdict:
+        verdict = ReviewVerdict(
+            id=new_id("review"),
+            run_id=run.run_id,
+            task_node_id=node.node_id,
+            role=node.agent_role,
+            decision=decision,
+            summary=summary,
+            repair_requested=repair_requested,
+            created_at=utc_now(),
+        )
+        self._result_list(run, "review_verdicts").append(verdict.model_dump())
+        self.database.append_event(
+            "review.decided",
+            verdict.model_dump(),
+            session_id=session.session_id,
+            run_id=run.run_id,
+        )
+        node.metadata["review_decision"] = decision
+        return verdict
 
     def _lease_expiry(self) -> str:
         return (datetime.now(timezone.utc) + timedelta(seconds=self.lease_timeout_seconds)).isoformat()
@@ -634,15 +1001,15 @@ class RuntimeService:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
     def _release_worker_assignment(self, worker_id: str, error: Optional[str] = None) -> None:
-        worker = self.worker_service.get_worker(worker_id)
-        worker.state = "unhealthy" if error else "idle"
+        worker = self.worker_registry.get_worker(worker_id)
+        worker.state = "draining" if worker.drain_state == "draining" and not error else ("unhealthy" if error else "idle")
         worker.current_run_id = None
         worker.current_task_node_id = None
         worker.current_lease_id = None
         worker.last_error = error
         worker.heartbeat_at = utc_now()
         worker.updated_at = worker.heartbeat_at
-        self.worker_service._persist_worker(worker)
+        self.worker_registry._persist(worker)
 
     @staticmethod
     def _task_node_by_id(task_graph, node_id: str) -> TaskNode:
@@ -714,9 +1081,9 @@ class RuntimeService:
             ready_nodes = self.orchestrator.next_wave(task_graph)
             if not ready_nodes:
                 break
-            idle_workers = [item for item in self.worker_service.list_workers() if item.state in {"idle", "registering"}]
+            idle_workers = [item for item in self.worker_registry.list_workers() if item.state in {"idle", "registering"}]
             if not idle_workers:
-                idle_workers = [self.worker_service.ensure_default_worker()]
+                idle_workers = [self.worker_registry.ensure_default_worker()]
             chunk_size = max(1, len(idle_workers))
             for offset in range(0, len(ready_nodes), chunk_size):
                 chunk = ready_nodes[offset : offset + chunk_size]
@@ -729,7 +1096,7 @@ class RuntimeService:
                 )
                 allocated = []
                 for node in chunk:
-                    worker = self.worker_service.acquire_worker(run.run_id, node.node_id)
+                    worker = self.worker_registry.acquire_worker(run.run_id, node.node_id)
                     allocated.append((node, worker))
                     run.assigned_worker_id = worker.worker_id
                     self.orchestrator.mark_node_status(
@@ -740,13 +1107,26 @@ class RuntimeService:
                     )
                     self.database.append_event(
                         "worker.assigned",
-                        {"worker_id": worker.worker_id, "state": "executing", "run_id": run.run_id, "task_node_id": node.node_id},
+                        {
+                            "worker_id": worker.worker_id,
+                            "state": "executing",
+                            "run_id": run.run_id,
+                            "task_node_id": node.node_id,
+                            "agent_role": node.agent_role,
+                        },
                         session_id=session.session_id,
                         run_id=run.run_id,
                     )
                     self.database.append_event(
                         "task.started",
-                        {"node_id": node.node_id, "label": node.label, "kind": node.kind, "role": node.role, "worker_id": worker.worker_id},
+                        {
+                            "node_id": node.node_id,
+                            "label": node.label,
+                            "kind": node.kind,
+                            "role": node.role,
+                            "agent_role": node.agent_role,
+                            "worker_id": worker.worker_id,
+                        },
                         session_id=session.session_id,
                         run_id=run.run_id,
                     )
@@ -760,7 +1140,7 @@ class RuntimeService:
                         final_verdict=final_verdict,
                     )
                     release_error = outcome.get("release_error")
-                    released = self.worker_service.release_worker(worker.worker_id, error=release_error)
+                    released = self.worker_registry.release_worker(worker.worker_id, error=release_error)
                     self.database.append_event(
                         "worker.released",
                         {
@@ -800,12 +1180,17 @@ class RuntimeService:
         elif run.status not in {"completed", "awaiting_approval"}:
             run.status = "completed"
             run.execution_trace.status = "completed"
-            run.result = {
+            self._merge_run_result(
+                run,
+                {
                 "summary": "Harness Lab run completed with a replayable trace.",
                 "output": run.result.get("output", {}),
                 "final_action": session.intent_declaration.suggested_action.model_dump(),
                 "completed_nodes": [node.node_id for node in task_graph.nodes if node.status == "completed"],
-            }
+                "context_selection_summary": run.result.get("context_selection_summary", context_summary or {}),
+                "final_verdict": run.result.get("final_verdict", final_verdict.model_dump()),
+                },
+            )
             session.status = "completed"
             self.database.append_event(
                 "run.completed",
@@ -850,6 +1235,7 @@ class RuntimeService:
                 session_id=session.session_id,
                 run_id=run.run_id,
             )
+            self._record_handoffs_for_node(run, session, node)
             return {"status": "completed"}
 
         if node.kind == "context":
@@ -865,6 +1251,7 @@ class RuntimeService:
                 session_id=session.session_id,
                 run_id=run.run_id,
             )
+            self._record_handoffs_for_node(run, session, node)
             return {"status": "completed"}
 
         if node.kind == "prompt":
@@ -889,6 +1276,7 @@ class RuntimeService:
                 session_id=session.session_id,
                 run_id=run.run_id,
             )
+            self._record_handoffs_for_node(run, session, node)
             return {"status": "completed"}
 
         if node.kind == "policy":
@@ -923,11 +1311,15 @@ class RuntimeService:
                     {"completed_at": utc_now(), "approval_id": approval.approval_id, "reason": approval.summary},
                 )
                 run.status = "awaiting_approval"
-                run.result = {
+                self._merge_run_result(
+                    run,
+                    {
                     "summary": "Run is waiting for operator approval.",
                     "approval_id": approval.approval_id,
                     "final_verdict": final_verdict.model_dump(),
-                }
+                    "context_selection_summary": run.result.get("context_selection_summary", context_summary or {}),
+                    },
+                )
                 run.execution_trace.status = "awaiting_approval"
                 run.updated_at = utc_now()
                 session.status = "awaiting_approval"
@@ -957,6 +1349,9 @@ class RuntimeService:
                 session_id=session.session_id,
                 run_id=run.run_id,
             )
+            decision, summary, repair_requested = self._review_decision(run, node, final_verdict=final_verdict)
+            self._record_review_verdict(run, session, node, decision, summary, repair_requested)
+            self._record_handoffs_for_node(run, session, node)
             return {"status": "completed"}
 
         if node.kind == "execution":
@@ -973,17 +1368,23 @@ class RuntimeService:
                 },
             )
             if result.ok:
-                run.result = {
+                self._merge_run_result(
+                    run,
+                    {
                     "summary": "Execution finished; awaiting review and learning stages.",
                     "output": result.output,
                     "final_action": session.intent_declaration.suggested_action.model_dump(),
-                }
+                    "final_verdict": run.result.get("final_verdict", final_verdict.model_dump()),
+                    "context_selection_summary": run.result.get("context_selection_summary", context_summary or {}),
+                    },
+                )
                 self.database.append_event(
                     "task.completed",
                     {"node_id": node.node_id, "label": node.label, "tool_name": session.intent_declaration.suggested_action.tool_name},
                     session_id=session.session_id,
                     run_id=run.run_id,
                 )
+                self._record_handoffs_for_node(run, session, node)
                 return {"status": "completed"}
             recovery = RecoveryEvent(
                 recovery_id=new_id("recovery"),
@@ -994,7 +1395,15 @@ class RuntimeService:
             run.execution_trace.recovery_events.append(recovery)
             run.execution_trace.status = "recovering" if self.orchestrator.has_node_kind(session.task_graph, "recovery") else "failed"
             run.status = "recovering" if self.orchestrator.has_node_kind(session.task_graph, "recovery") else "failed"
-            run.result = {"summary": "Run failed during execution.", "reason": recovery.summary}
+            self._merge_run_result(
+                run,
+                {
+                "summary": "Run failed during execution.",
+                "reason": recovery.summary,
+                "final_verdict": run.result.get("final_verdict", final_verdict.model_dump()),
+                "context_selection_summary": run.result.get("context_selection_summary", context_summary or {}),
+                },
+            )
             session.status = "running" if self.orchestrator.has_node_kind(session.task_graph, "recovery") else "failed"
             self.database.append_event(
                 "task.failed",
@@ -1040,6 +1449,7 @@ class RuntimeService:
                 session_id=session.session_id,
                 run_id=run.run_id,
             )
+            self._record_handoffs_for_node(run, session, node)
             return {"status": "completed"}
 
         if node.kind == "review":
@@ -1048,18 +1458,21 @@ class RuntimeService:
                 "recovery_events": len(run.execution_trace.recovery_events),
                 "policy_verdicts": len(run.execution_trace.policy_verdicts),
             }
+            decision, summary, repair_requested = self._review_decision(run, node)
             self.orchestrator.mark_node_status(
                 session.task_graph,
                 node.node_id,
                 "completed",
-                {"completed_at": utc_now(), "review": review_summary},
+                {"completed_at": utc_now(), "review": review_summary, "decision": decision},
             )
             self.database.append_event(
                 "task.completed",
-                {"node_id": node.node_id, "label": node.label, "review": review_summary},
+                {"node_id": node.node_id, "label": node.label, "review": review_summary, "decision": decision},
                 session_id=session.session_id,
                 run_id=run.run_id,
             )
+            self._record_review_verdict(run, session, node, decision, summary, repair_requested)
+            self._record_handoffs_for_node(run, session, node)
             return {"status": "completed"}
 
         if node.kind == "learning":
@@ -1093,6 +1506,7 @@ class RuntimeService:
                 session_id=session.session_id,
                 run_id=run.run_id,
             )
+            self._record_handoffs_for_node(run, session, node)
             return {"status": "completed"}
 
         self.orchestrator.mark_node_status(session.task_graph, node.node_id, "completed", {"completed_at": utc_now()})
@@ -1102,13 +1516,15 @@ class RuntimeService:
             session_id=session.session_id,
             run_id=run.run_id,
         )
+        self._record_handoffs_for_node(run, session, node)
         return {"status": "completed"}
 
     async def _execute_action(self, run: ResearchRun, session: ResearchSession):
-        if self._action_requires_approval_token(session.intent_declaration.suggested_action) and not self._approval_token_for_run(run.run_id):
+        action = self._action_with_runtime_context(run, session.intent_declaration.suggested_action)
+        if self._action_requires_approval_token(action) and not self._approval_token_for_run(run.run_id):
             result = ToolExecutionResult(ok=False, error="Mutating action is missing an approval token.")
             call = ToolCallRecord(
-                tool_name=session.intent_declaration.suggested_action.tool_name,
+                tool_name=action.tool_name,
                 payload=session.intent_declaration.suggested_action.payload,
                 ok=result.ok,
                 output=result.output,
@@ -1139,9 +1555,9 @@ class RuntimeService:
             )
             result = self.tool_gateway.model_reflection_result(reflection)
         else:
-            result = await self.tool_gateway.execute(run.run_id, session.intent_declaration.suggested_action)
+            result = await self.tool_gateway.execute(run.run_id, action)
         call = ToolCallRecord(
-            tool_name=session.intent_declaration.suggested_action.tool_name,
+            tool_name=action.tool_name,
             payload=session.intent_declaration.suggested_action.payload,
             ok=result.ok,
             output=result.output,
@@ -1151,10 +1567,29 @@ class RuntimeService:
         run.execution_trace.tool_calls.append(call)
         self.database.append_event(
             "tool.executed",
-            {"tool_name": call.tool_name, "ok": call.ok, "error": call.error},
+            {
+                "tool_name": call.tool_name,
+                "ok": call.ok,
+                "error": call.error,
+                "sandboxed": isinstance(call.output.get("sandbox_trace"), dict),
+                "changed_paths": call.output.get("changed_paths", []),
+            },
             session_id=session.session_id,
             run_id=run.run_id,
         )
+        sandbox_trace = call.output.get("sandbox_trace")
+        if isinstance(sandbox_trace, dict):
+            self.database.append_event(
+                "sandbox.executed" if call.ok else "sandbox.failed",
+                {
+                    "tool_name": call.tool_name,
+                    "worker_id": run.assigned_worker_id,
+                    "changed_paths": call.output.get("changed_paths", []),
+                    "sandbox_trace": sandbox_trace,
+                },
+                session_id=session.session_id,
+                run_id=run.run_id,
+            )
         return result
 
     @staticmethod
@@ -1182,13 +1617,13 @@ class RuntimeService:
         run.execution_trace.recovery_events.append(
             RecoveryEvent(recovery_id=new_id("recovery"), kind=kind, summary=reason, created_at=utc_now())
         )
-        run.result = {"summary": "Run terminated before execution.", "reason": reason}
+        self._merge_run_result(run, {"summary": "Run terminated before execution.", "reason": reason})
         run.execution_trace.updated_at = utc_now()
         run.updated_at = utc_now()
         session.status = "failed"
         session.updated_at = utc_now()
         if run.assigned_worker_id:
-            self.worker_service.release_worker(run.assigned_worker_id, error=reason)
+            self.worker_registry.release_worker(run.assigned_worker_id, error=reason)
             self.database.append_event(
                 "worker.released",
                 {"worker_id": run.assigned_worker_id, "state": "unhealthy", "reason": reason},
@@ -1214,6 +1649,10 @@ class RuntimeService:
             "run": run.model_dump(),
             "session": self.get_session(run.session_id).model_dump(),
             "mission": mission.model_dump() if mission else None,
+            "mission_phase": self.mission_phase_snapshot(run.run_id).model_dump(),
+            "handoffs": self.run_handoffs(run.run_id),
+            "review_verdicts": self.run_review_verdicts(run.run_id),
+            "role_timeline": self.run_role_timeline(run.run_id),
             "events": [event.model_dump() for event in self.database.list_events(run_id=run.run_id, limit=500)],
             "approvals": [approval.model_dump() for approval in self.database.list_approvals(run_id=run.run_id)],
             "artifacts": [artifact.model_dump() for artifact in self.database.list_artifacts(run_id=run.run_id)],

@@ -39,11 +39,13 @@ import type {
   EvaluationReport,
   EventEnvelope,
   ExperimentRun,
+  FleetStatusReport,
   FailureCluster,
   HarnessPolicy,
   ImprovementCandidate,
   PromptFrame,
   PublishGateStatus,
+  QueueShardStatus,
   ReplayEnvelope,
   ResearchRun,
   ResearchSession,
@@ -119,6 +121,8 @@ function App() {
   const [catalog, setCatalog] = useState<SettingsCatalog | null>(null)
   const [health, setHealth] = useState<Record<string, unknown> | null>(null)
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([])
+  const [fleetStatus, setFleetStatus] = useState<FleetStatusReport | null>(null)
+  const [queueStatus, setQueueStatus] = useState<QueueShardStatus[]>([])
 
   const selectedSession = useMemo(
     () => sessions.find((sessionItem) => sessionItem.session_id === selectedSessionId) || null,
@@ -173,6 +177,8 @@ function App() {
       approvalEnvelope,
       catalogEnvelope,
       healthEnvelope,
+      fleetEnvelope,
+      queueEnvelope,
     ] =
       await Promise.all([
         api.listConstraints(),
@@ -187,6 +193,8 @@ function App() {
         api.listApprovals(),
         api.settingsCatalog(),
         api.health(),
+        api.fleetStatus(),
+        api.queueStatus(),
       ])
     setConstraints(constraintEnvelope.data)
     setPolicies(policyEnvelope.data)
@@ -202,6 +210,20 @@ function App() {
     setApprovals(approvalEnvelope.data)
     setCatalog(catalogEnvelope.data)
     setHealth(healthEnvelope.data)
+    setFleetStatus(fleetEnvelope.data)
+    setQueueStatus(queueEnvelope.data)
+  }
+
+  const drainWorker = async (workerId: string) => {
+    await api.drainWorker(workerId, 'drained from web mission control')
+    message.success('Worker draining')
+    await refreshSharedData()
+  }
+
+  const resumeWorker = async (workerId: string) => {
+    await api.resumeWorker(workerId)
+    message.success('Worker resumed')
+    await refreshSharedData()
   }
 
   const refreshSessionResearch = async (sessionId: string) => {
@@ -691,9 +713,14 @@ function App() {
               />
               <JsonCard title="Assigned Worker" value={runDetail.worker || {}} />
               <JsonCard title="Mission" value={runDetail.mission || {}} />
+              <JsonCard title="Mission Phase" value={runDetail.mission_phase || {}} />
               <JsonCard title="Run Status Summary" value={runDetail.status_summary || {}} />
               <JsonCard title="Coordination Snapshot" value={runDetail.coordination_snapshot || {}} />
               <JsonCard title="Timeline Summary" value={runDetail.timeline_summary || {}} />
+              <JsonCard title="Role Timeline" value={runDetail.role_timeline || []} />
+              <JsonCard title="Handoffs" value={runDetail.handoffs || []} />
+              <JsonCard title="Review Decisions" value={runDetail.review_verdicts || []} />
+              <JsonCard title="Sandbox Summary" value={runDetail.sandbox_summary || {}} />
               <JsonCard title="Task Attempts" value={runDetail.attempts || []} />
               <JsonCard title="Worker Leases" value={runDetail.leases || []} />
               <JsonCard title="Active Policy" value={runDetail.active_policy || {}} />
@@ -861,7 +888,7 @@ function App() {
                       <StatusPill value={candidate.publish_status} />
                     </Space>
                   }
-                  description={candidate.rationale}
+                  description={`${candidate.rationale} | proposal=${String(candidate.metrics?.proposal_summary || 'n/a')} | clusters=${String((candidate.metrics?.diagnosis as { cluster_count?: number } | undefined)?.cluster_count ?? 'n/a')}`}
                 />
               </List.Item>
             )}
@@ -870,6 +897,7 @@ function App() {
           <JsonCard title="Policy Diff" value={policyDiff || { note: 'Choose two policies to compare.' }} />
           <JsonCard title="Workflow Diff" value={workflowDiff || { note: 'Choose two workflows to compare.' }} />
           <JsonCard title="Selected Candidate" value={selectedCandidate || { note: 'Select a candidate to inspect.' }} />
+          <JsonCard title="Candidate Trace Evidence" value={(selectedCandidate?.metrics as { trace_evidence?: unknown } | undefined)?.trace_evidence || []} />
           <JsonCard title="Publish Gate" value={candidateGate || { note: 'Select a candidate to inspect its gate.' }} />
           <JsonCard title="Candidate Evaluations" value={selectedCandidateEvaluations} />
         </Card>
@@ -921,6 +949,7 @@ function App() {
           />
           <Divider />
           <JsonCard title="Selected Evaluation" value={selectedEvaluation || { note: 'Select an evaluation to inspect.' }} />
+          <JsonCard title="Evaluation Metrics" value={selectedEvaluation?.metrics || {}} />
           <JsonCard title="Suite Manifest" value={selectedEvaluation?.suite_manifest || {}} />
           <JsonCard title="Bucket Results" value={selectedEvaluation?.bucket_results || []} />
           <JsonCard title="Hard Failures" value={selectedEvaluation?.hard_failures || []} />
@@ -934,11 +963,12 @@ function App() {
                 <List.Item.Meta
                   title={
                     <Space>
-                      <span>{cluster.signature}</span>
+                      <span>{cluster.signature_type}</span>
+                      <Tag>{cluster.roles.join(', ') || 'roles:n/a'}</Tag>
                       <Tag color="red">{cluster.frequency}</Tag>
                     </Space>
                   }
-                  description={`policies=${cluster.affected_policies.join(', ') || 'n/a'} workflows=${cluster.affected_workflows.join(', ') || 'n/a'}`}
+                  description={`handoffs=${cluster.handoff_pairs.join(', ') || 'n/a'} reviews=${cluster.review_decisions.join(', ') || 'n/a'} policies=${cluster.affected_policies.join(', ') || 'n/a'} workflows=${cluster.affected_workflows.join(', ') || 'n/a'}`}
                 />
               </List.Item>
             )}
@@ -974,10 +1004,46 @@ function App() {
             title="Fleet Health"
             value={{
               active_workers: health?.active_workers || [],
+              draining_workers: health?.draining_workers || [],
               offline_workers: health?.offline_workers || [],
               unhealthy_workers: health?.unhealthy_workers || [],
               stuck_runs: health?.stuck_runs || [],
             }}
+          />
+          <Divider />
+          <JsonCard title="Fleet Status" value={fleetStatus || {}} />
+          <Divider />
+          <JsonCard title="Queue Shards" value={queueStatus} />
+          <Divider />
+          <List
+            header="Worker Controls"
+            dataSource={workers}
+            renderItem={(worker) => (
+              <List.Item
+                actions={[
+                  worker.drain_state === 'draining' ? (
+                    <Button key="resume" size="small" onClick={() => void resumeWorker(worker.worker_id)}>
+                      Resume
+                    </Button>
+                  ) : (
+                    <Button key="drain" size="small" onClick={() => void drainWorker(worker.worker_id)}>
+                      Drain
+                    </Button>
+                  ),
+                ]}
+              >
+                <List.Item.Meta
+                  title={
+                    <Space>
+                      <span>{worker.label}</span>
+                      <StatusPill value={worker.state} />
+                      {worker.drain_state === 'draining' ? <Tag color="orange">draining</Tag> : null}
+                    </Space>
+                  }
+                  description={`role=${worker.role_profile || 'general'} labels=${(worker.labels || []).join(', ') || 'n/a'} class=${worker.worker_class || 'general'}`}
+                />
+              </List.Item>
+            )}
           />
           <Divider />
           <JsonCard title="Execution Plane" value={catalog?.execution_plane || {}} />

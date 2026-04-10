@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from ..bootstrap import harness_lab_services
-from ..types import PolicyCandidateRequest, WorkflowCandidateRequest
+from ..types import ImprovementDiagnoseRequest, PolicyCandidateRequest, WorkflowCandidateRequest
 
 router = APIRouter(prefix="/api", tags=["candidates"])
 
@@ -35,6 +35,9 @@ async def create_policy_candidate(request: PolicyCandidateRequest):
             "candidate": payload["candidate"].model_dump(),
             "version": payload["version"].model_dump(),
             "observations": payload["observations"],
+            "diagnosis": payload["diagnosis"].model_dump(),
+            "evaluations": [item.model_dump() for item in payload["evaluations"]],
+            "gate": payload["gate"].model_dump(),
         },
     }
 
@@ -52,8 +55,17 @@ async def create_workflow_candidate(request: WorkflowCandidateRequest):
             "candidate": payload["candidate"].model_dump(),
             "version": payload["version"].model_dump(),
             "observations": payload["observations"],
+            "diagnosis": payload["diagnosis"].model_dump(),
+            "evaluations": [item.model_dump() for item in payload["evaluations"]],
+            "gate": payload["gate"].model_dump(),
         },
     }
+
+
+@router.post("/improvement/diagnose")
+async def diagnose_improvement(request: ImprovementDiagnoseRequest):
+    report = harness_lab_services.improvement.diagnose(trace_refs=request.trace_refs)
+    return {"success": True, "data": report.model_dump()}
 
 
 @router.post("/candidates/{candidate_id}/approve")

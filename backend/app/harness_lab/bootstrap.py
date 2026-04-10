@@ -4,10 +4,12 @@ import json
 from typing import Any, Optional
 
 from .boundary.gateway import ToolGateway
+from .boundary.sandbox import SandboxManager
 from .constraints.engine import ConstraintEngine
 from .context.manager import ContextManager
 from .dispatch_queue import DispatchQueue, InMemoryDispatchQueue
 from .improvement.service import ImprovementService
+from .knowledge.service import KnowledgeIndexService
 from .optimizer.service import OptimizerService
 from .orchestrator.service import OrchestratorService
 from .prompting.assembler import PromptAssembler
@@ -17,7 +19,7 @@ from .settings import HarnessLabSettings
 from .storage import PlatformStore, PostgresPlatformStore
 from .types import ConstraintDocument, ContextProfile, HarnessPolicy, ModelProfile, PromptTemplate, WorkflowTemplateVersion
 from .utils import utc_now
-from .workers.service import WorkerService
+
 
 
 class HarnessLabServices:
@@ -33,12 +35,18 @@ class HarnessLabServices:
         self.database = database
         self.dispatch_queue = dispatch_queue
         self.constraint_engine = ConstraintEngine(self.database)
-        self.context_manager = ContextManager(self.database)
-        self.tool_gateway = ToolGateway(self.database, self.constraint_engine)
+        self.sandbox = SandboxManager(self.settings, self.database)
+        self.knowledge = KnowledgeIndexService(self.database)
+        self.context_manager = ContextManager(self.database, knowledge_index=self.knowledge)
+        self.tool_gateway = ToolGateway(
+            self.database,
+            self.constraint_engine,
+            knowledge_index=self.knowledge,
+            sandbox_manager=self.sandbox,
+        )
         self.model_registry = ModelRegistry()
         self.orchestrator = OrchestratorService()
         self.prompt_assembler = PromptAssembler()
-        self.workers = WorkerService(self.database)
         self.runtime = RuntimeService(
             database=self.database,
             dispatch_queue=self.dispatch_queue,
@@ -48,8 +56,9 @@ class HarnessLabServices:
             model_registry=self.model_registry,
             orchestrator=self.orchestrator,
             prompt_assembler=self.prompt_assembler,
-            worker_service=self.workers,
         )
+        # Keep a stable worker registry surface for control-plane routes and CLI.
+        self.workers = self.runtime.worker_registry
         self.optimizer = OptimizerService(self.database)
         self.improvement = ImprovementService(self.database)
         self._seed_defaults()
@@ -143,7 +152,7 @@ class HarnessLabServices:
             dag={
                 "nodes": [
                     {"key": "plan", "label": "Plan Mission", "kind": "planning", "role": "planner"},
-                    {"key": "context", "label": "Assemble Context", "kind": "context", "role": "planner"},
+                    {"key": "context", "label": "Assemble Context", "kind": "context", "role": "researcher"},
                     {"key": "prompt", "label": "Render Prompt Frame", "kind": "prompt", "role": "planner"},
                     {"key": "policy", "label": "Run Policy Preflight", "kind": "policy", "role": "reviewer"},
                     {"key": "execute", "label": "Execute Action", "kind": "execution", "role": "executor"},
@@ -156,12 +165,13 @@ class HarnessLabServices:
                     {"source": "context", "target": "prompt", "kind": "depends_on"},
                     {"source": "prompt", "target": "execute", "kind": "depends_on"},
                     {"source": "policy", "target": "execute", "kind": "depends_on"},
-                    {"source": "execute", "target": "review", "kind": "depends_on"},
+                    {"source": "execute", "target": "review", "kind": "handoff"},
                     {"source": "review", "target": "learn", "kind": "depends_on"},
                 ],
             },
             role_map={
                 "planner": "Creates bounded task packets and context bundles.",
+                "researcher": "Builds context packets and repository-grounded recommendations before execution.",
                 "executor": "Performs the selected tool action inside policy boundaries.",
                 "reviewer": "Checks the result before the run is marked complete.",
                 "recovery": "Captures learnings and prepares retry-ready recovery traces.",
@@ -197,7 +207,7 @@ class HarnessLabServices:
             dag={
                 "nodes": [
                     {"key": "plan", "label": "Plan Mission", "kind": "planning", "role": "planner"},
-                    {"key": "context", "label": "Assemble Context", "kind": "context", "role": "planner"},
+                    {"key": "context", "label": "Assemble Context", "kind": "context", "role": "researcher"},
                     {"key": "prompt", "label": "Render Prompt Frame", "kind": "prompt", "role": "planner"},
                     {"key": "policy", "label": "Run Policy Preflight", "kind": "policy", "role": "reviewer"},
                     {"key": "execute", "label": "Execute Action", "kind": "execution", "role": "executor"},
@@ -212,7 +222,7 @@ class HarnessLabServices:
                     {"source": "prompt", "target": "execute", "kind": "depends_on"},
                     {"source": "policy", "target": "execute", "kind": "depends_on"},
                     {"source": "execute", "target": "recovery", "kind": "on_failure"},
-                    {"source": "execute", "target": "review", "kind": "depends_on"},
+                    {"source": "execute", "target": "review", "kind": "handoff"},
                     {"source": "recovery", "target": "review", "kind": "handoff"},
                     {"source": "review", "target": "learn", "kind": "depends_on"},
                 ],
@@ -338,6 +348,8 @@ class HarnessLabServices:
     def doctor_report(self) -> dict:
         self.runtime.reclaim_stale_leases()
         provider = self.runtime.get_model_provider_settings().model_dump()
+        knowledge = self.knowledge.status().model_dump()
+        sandbox = self.sandbox.status().model_dump()
         workers = self.workers.list_workers()
         candidates = self.improvement.list_candidates()
         evaluations = self.improvement.list_evaluations()
@@ -355,8 +367,18 @@ class HarnessLabServices:
             warnings.append(f"Offline workers detected: {', '.join(execution['offline_workers'])}.")
         if execution["unhealthy_workers"]:
             warnings.append(f"Unhealthy workers detected: {', '.join(execution['unhealthy_workers'])}.")
+        if execution["draining_workers"]:
+            warnings.append(f"Workers are draining: {', '.join(execution['draining_workers'])}.")
         if execution["stuck_runs"]:
             warnings.append(f"Stuck run candidates detected: {len(execution['stuck_runs'])}.")
+        if not sandbox["docker_ready"]:
+            warnings.append("Docker sandbox backend is not ready.")
+        elif not sandbox["sandbox_image_ready"]:
+            warnings.append(f"Sandbox image is missing: {sandbox['image']}.")
+        if not knowledge["ready"]:
+            warnings.append("Knowledge index has not been built yet; retrieval will use live fallback search.")
+        elif knowledge["fallback_mode"]:
+            warnings.append("Knowledge index is running in fallback mode; semantic retrieval is unavailable.")
         published_workflows = [item for item in self.improvement.list_workflows() if item.status == "published"]
         if not published_workflows:
             warnings.append("No published workflow template is available.")
@@ -368,10 +390,14 @@ class HarnessLabServices:
                 "workflows": len(self.improvement.list_workflows()),
             },
             "provider": provider,
+            "knowledge": knowledge,
+            "sandbox": sandbox,
             "workers": {
                 "count": len(workers),
                 "healthy": len([item for item in workers if item.state in {"idle", "leased", "executing"}]),
                 "by_state": execution["worker_count_by_state"],
+                "by_role": execution["workers_by_role"],
+                "draining_workers": execution["draining_workers"],
                 "unhealthy_workers": [item.worker_id for item in workers if item.state in {"offline", "unhealthy"}],
                 "active_workers": execution["active_workers"],
             },
@@ -382,7 +408,15 @@ class HarnessLabServices:
                 "evaluations": len(evaluations),
             },
             "warnings": warnings,
-            "doctor_ready": provider["model_ready"] and bool(workers) and bool(published_workflows) and execution["postgres_ready"] and execution["redis_ready"],
+            "doctor_ready": (
+                provider["model_ready"]
+                and bool(workers)
+                and bool(published_workflows)
+                and execution["postgres_ready"]
+                and execution["redis_ready"]
+                and sandbox["docker_ready"]
+                and sandbox["sandbox_image_ready"]
+            ),
         }
 
     def close(self) -> None:

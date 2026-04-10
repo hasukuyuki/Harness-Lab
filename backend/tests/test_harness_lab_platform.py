@@ -17,7 +17,7 @@ from backend.app.harness_lab.dispatch_queue import InMemoryDispatchQueue
 from backend.app.harness_lab.runtime.models import normalize_base_url
 from backend.app.harness_lab.settings import HarnessLabSettings
 from backend.app.harness_lab.storage import SqliteTestPlatformStore
-from backend.app.harness_lab.types import ModelCallTrace
+from backend.app.harness_lab.types import BenchmarkBucketResult, EvaluationFailure, EvaluationReport, ModelCallTrace
 from backend.app.harness_lab.workers.runtime_client import WorkerExecutionLoop, WorkerRuntimeClient
 from backend.app.main import app
 
@@ -128,6 +128,11 @@ def test_provider_settings_health_and_catalog(client, monkeypatch):
     assert "unhealthy_workers" in health_data
     assert "active_workers" in health_data
     assert "stuck_runs" in health_data
+    assert "sandbox_backend" in health_data
+    assert "docker_ready" in health_data
+    assert "sandbox_image_ready" in health_data
+    assert "sandbox_active_runs" in health_data
+    assert "sandbox_failures" in health_data
 
     catalog = client.get("/api/settings/catalog")
     assert catalog.status_code == 200
@@ -136,6 +141,7 @@ def test_provider_settings_health_and_catalog(client, monkeypatch):
     assert catalog_data["model_provider"]["fallback_mode"] is True
     assert catalog_data["execution_plane"]["storage_backend"] == "sqlite_test"
     assert "worker_count_by_state" in catalog_data["execution_plane"]
+    assert "sandbox" in catalog_data
     assert "workflow_templates" in catalog_data
     assert "workers" in catalog_data
 
@@ -338,6 +344,196 @@ def test_reclaim_stale_lease_and_status_filter(client, monkeypatch):
     assert redispatched[0]["task_node_id"] == dispatch["task_node_id"]
 
 
+def test_sandbox_dispatch_fields_for_git_worker(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="git")
+
+    session = client.post(
+        "/api/sessions",
+        json={"goal": "Inspect git state remotely.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+    worker = client.post(
+        "/api/workers",
+        json={"label": "git-worker", "capabilities": ["git"], "version": "v1"},
+    ).json()["data"]
+    dispatch = client.post(f"/api/workers/{worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"][0]
+
+    assert dispatch["requires_sandbox"] is True
+    assert dispatch["sandbox_mode"] == "docker"
+    assert dispatch["network_policy"] == "none"
+    assert dispatch["sandbox_spec"]["image"]
+
+
+def test_multi_agent_run_detail_exposes_mission_phase_handoffs_and_reviews(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session = client.post(
+        "/api/sessions",
+        json={
+            "goal": "Research the runtime before taking action.",
+            "context": {"path": "backend/app/harness_lab/runtime"},
+            "execution_mode": "single_worker",
+        },
+    ).json()["data"]
+    run = client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+
+    detail = client.get(f"/api/runs/{run['run_id']}").json()
+    assert detail["mission_phase"]["phase"] == "mission_completion"
+    assert detail["handoffs"]
+    assert detail["review_verdicts"]
+    assert detail["role_timeline"]
+    roles = {packet["from_role"] for packet in detail["handoffs"]} | {packet["to_role"] for packet in detail["handoffs"]}
+    assert {"planner", "researcher", "reviewer", "executor"}.issubset(roles)
+    assert any(verdict["decision"] in {"accept", "complete"} for verdict in detail["review_verdicts"])
+
+
+def test_role_profile_filters_remote_dispatch(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session = client.post(
+        "/api/sessions",
+        json={"goal": "Search remotely.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+
+    wrong_worker = client.post(
+        "/api/workers",
+        json={"label": "executor-only", "capabilities": ["knowledge_search"], "role_profile": "executor", "version": "v1"},
+    ).json()["data"]
+    wrong_dispatches = client.post(f"/api/workers/{wrong_worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"]
+    assert wrong_dispatches == []
+
+    planner_worker = client.post(
+        "/api/workers",
+        json={"label": "planner-worker", "capabilities": [], "role_profile": "planner", "version": "v1"},
+    ).json()["data"]
+    planner_dispatches = client.post(f"/api/workers/{planner_worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"]
+    assert len(planner_dispatches) == 1
+    assert planner_dispatches[0]["agent_role"] == "planner"
+
+
+def test_dispatch_constraints_route_by_required_labels_and_shards(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session_payload = client.post(
+        "/api/sessions",
+        json={"goal": "Search remotely with labeled planners.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    session = harness_lab_services.runtime.get_session(session_payload["session_id"])
+    planner_node = next(node for node in session.task_graph.nodes if node.agent_role == "planner")
+    planner_node.metadata["required_labels"] = ["planner-eu"]
+    planner_node.metadata["preferred_labels"] = ["research"]
+    harness_lab_services.runtime._persist_session(session)
+
+    client.post("/api/runs", json={"session_id": session.session_id}).json()["data"]
+
+    wrong_worker = client.post(
+        "/api/workers",
+        json={"label": "planner-us", "capabilities": [], "role_profile": "planner", "labels": ["planner-us"], "version": "v1"},
+    ).json()["data"]
+    assert client.post(f"/api/workers/{wrong_worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"] == []
+
+    correct_worker = client.post(
+        "/api/workers",
+        json={
+            "label": "planner-eu",
+            "capabilities": [],
+            "role_profile": "planner",
+            "labels": ["planner-eu", "research"],
+            "version": "v1",
+        },
+    ).json()["data"]
+    dispatch = client.post(f"/api/workers/{correct_worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"][0]
+    assert dispatch["required_labels"] == ["planner-eu"]
+    assert dispatch["preferred_labels"] == ["research"]
+    assert dispatch["queue_shard"].startswith("planner/")
+
+
+def test_worker_drain_blocks_new_dispatch_and_resume_recovers(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session = client.post(
+        "/api/sessions",
+        json={"goal": "Search remotely.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+
+    worker = client.post(
+        "/api/workers",
+        json={"label": "drainable-planner", "capabilities": [], "role_profile": "planner", "labels": ["planner"], "version": "v1"},
+    ).json()["data"]
+    drained = client.post(f"/api/workers/{worker['worker_id']}/drain", json={"reason": "maintenance window"}).json()["data"]
+    assert drained["drain_state"] == "draining"
+
+    no_dispatch = client.post(f"/api/workers/{worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"]
+    assert no_dispatch == []
+
+    resumed = client.post(f"/api/workers/{worker['worker_id']}/resume").json()["data"]
+    assert resumed["drain_state"] == "active"
+    dispatch = client.post(f"/api/workers/{worker['worker_id']}/poll", json={"max_tasks": 1}).json()["data"]["dispatches"][0]
+    assert dispatch["agent_role"] == "planner"
+
+
+def test_fleet_and_queue_status_expose_shards_and_drain_state(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session_payload = client.post(
+        "/api/sessions",
+        json={"goal": "Inspect queue shards.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    session = harness_lab_services.runtime.get_session(session_payload["session_id"])
+    planner_node = next(node for node in session.task_graph.nodes if node.agent_role == "planner")
+    planner_node.metadata["required_labels"] = ["planner-eu"]
+    harness_lab_services.runtime._persist_session(session)
+    client.post("/api/runs", json={"session_id": session.session_id}).json()["data"]
+
+    worker = client.post(
+        "/api/workers",
+        json={"label": "planner-eu", "capabilities": [], "role_profile": "planner", "labels": ["planner-eu"], "version": "v1"},
+    ).json()["data"]
+    client.post(f"/api/workers/{worker['worker_id']}/drain", json={"reason": "queue test"})
+
+    fleet = client.get("/api/fleet/status").json()["data"]
+    assert worker["worker_id"] in fleet["draining_workers"]
+    assert "planner" in fleet["workers_by_role"]
+    assert "late_callback_count" in fleet
+
+    queues = client.get("/api/queues").json()["data"]
+    assert queues
+    assert any(item["shard"].startswith("planner/") for item in queues)
+
+
+def test_run_status_summary_reports_dispatch_blockers(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session_payload = client.post(
+        "/api/sessions",
+        json={"goal": "Show dispatch blockers.", "context": {"path": "."}, "execution_mode": "remote_worker"},
+    ).json()["data"]
+    session = harness_lab_services.runtime.get_session(session_payload["session_id"])
+    planner_node = next(node for node in session.task_graph.nodes if node.agent_role == "planner")
+    planner_node.metadata["required_labels"] = ["gpu"]
+    harness_lab_services.runtime._persist_session(session)
+    run = client.post("/api/runs", json={"session_id": session.session_id}).json()["data"]
+
+    client.post(
+        "/api/workers",
+        json={"label": "planner", "capabilities": [], "role_profile": "planner", "labels": ["planner"], "version": "v1"},
+    )
+
+    detail = client.get(f"/api/runs/{run['run_id']}").json()
+    assert detail["status_summary"]["kind"] == "dispatch_blocked"
+    assert detail["coordination_snapshot"]["dispatch_blockers"]
+    assert detail["coordination_snapshot"]["dispatch_blockers"][0]["kind"] == "awaiting_required_label"
+
+
 def test_duplicate_lease_completion_is_idempotent(client, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     _mock_provider(monkeypatch, intent_tool="model_reflection", reflection_summary="Remote reflection completed.")
@@ -409,6 +605,8 @@ def test_worker_detail_summary_and_heartbeat_events(client, monkeypatch):
     assert worker_payload["health_summary"]["worker_id"] == worker["worker_id"]
     assert dispatch["lease_id"] in worker_payload["health_summary"]["recent_lease_ids"]
     assert any(event["event_type"] == "lease.heartbeat" for event in worker_payload["recent_events"])
+    assert "sandbox" in worker_payload
+    assert "role_profile" in worker_payload
 
     run_detail = client.get(f"/api/runs/{run['run_id']}")
     assert run_detail.status_code == 200
@@ -416,6 +614,31 @@ def test_worker_detail_summary_and_heartbeat_events(client, monkeypatch):
     assert run_payload["timeline_summary"]["entries"][0]["lease_id"] == dispatch["lease_id"]
     assert "mission_status" in run_payload["coordination_snapshot"]
     assert run_payload["status_summary"]["kind"] == "active_lease"
+    assert "sandbox_summary" in run_payload
+
+
+def test_recovery_workflow_records_request_repair_review_verdict(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    async def failing_execute(run_id, action):  # noqa: ARG001
+        from backend.app.harness_lab.types import ToolExecutionResult
+        return ToolExecutionResult(ok=False, error="synthetic execution failure")
+
+    monkeypatch.setattr(harness_lab_services.tool_gateway, "execute", failing_execute)
+
+    session = client.post(
+        "/api/sessions",
+        json={
+            "goal": "Trigger recovery review flow.",
+            "context": {"path": "backend/app/harness_lab/runtime"},
+            "workflow_template_id": "workflow_template_recovery_ring_v1",
+            "execution_mode": "single_worker",
+        },
+    ).json()["data"]
+    run = client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+    detail = client.get(f"/api/runs/{run['run_id']}").json()
+    assert any(verdict["decision"] == "request_repair" for verdict in detail["review_verdicts"])
 
 
 def test_remote_worker_http_loop_completes_run(client, monkeypatch):
@@ -526,3 +749,133 @@ def test_remote_worker_policy_gate_is_not_marked_stuck(client, monkeypatch):
 
     health = client.get("/api/health").json()["data"]
     assert all(item["run_id"] != run["run_id"] for item in health["stuck_runs"])
+
+
+def test_improvement_diagnosis_and_failure_clusters_capture_multi_agent_signals(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    async def failing_execute(run_id, action):  # noqa: ARG001
+        from backend.app.harness_lab.types import ToolExecutionResult
+
+        return ToolExecutionResult(ok=False, error="synthetic execution failure")
+
+    monkeypatch.setattr(harness_lab_services.tool_gateway, "execute", failing_execute)
+
+    session = client.post(
+        "/api/sessions",
+        json={
+            "goal": "Trigger multi-agent diagnosis.",
+            "context": {"path": "backend/app/harness_lab/runtime"},
+            "workflow_template_id": "workflow_template_recovery_ring_v1",
+            "execution_mode": "single_worker",
+        },
+    ).json()["data"]
+    run = client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+
+    diagnosis = client.post("/api/improvement/diagnose", json={"trace_refs": [run["run_id"]]}).json()["data"]
+    assert diagnosis["cluster_count"] >= 1
+    assert any(cluster["signature_type"] in {"review_reject_loop", "repair_path_failure"} for cluster in diagnosis["clusters"])
+    assert any(cluster["roles"] for cluster in diagnosis["clusters"])
+    assert any(cluster["handoff_pairs"] for cluster in diagnosis["clusters"])
+
+    clusters = client.get("/api/failure-clusters").json()["data"]
+    assert any(cluster["signature_type"] in {"review_reject_loop", "repair_path_failure"} for cluster in clusters)
+
+
+def test_policy_and_workflow_candidates_auto_evaluate_from_multi_agent_traces(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    async def failing_execute(run_id, action):  # noqa: ARG001
+        from backend.app.harness_lab.types import ToolExecutionResult
+
+        return ToolExecutionResult(ok=False, error="synthetic execution failure")
+
+    monkeypatch.setattr(harness_lab_services.tool_gateway, "execute", failing_execute)
+
+    session = client.post(
+        "/api/sessions",
+        json={
+            "goal": "Generate trace-aware candidates.",
+            "context": {"path": "backend/app/harness_lab/runtime"},
+            "workflow_template_id": "workflow_template_recovery_ring_v1",
+            "execution_mode": "single_worker",
+        },
+    ).json()["data"]
+    run = client.post("/api/runs", json={"session_id": session["session_id"]}).json()["data"]
+
+    policy_payload = client.post(
+        "/api/improvement/candidates/policy",
+        json={"trace_refs": [run["run_id"]]},
+    ).json()["data"]
+    assert policy_payload["candidate"]["evaluation_ids"]
+    assert len(policy_payload["evaluations"]) == 2
+    assert policy_payload["candidate"]["metrics"]["diagnosis"]["cluster_count"] >= 1
+    assert policy_payload["gate"]["candidate_id"] == policy_payload["candidate"]["candidate_id"]
+
+    workflow_payload = client.post(
+        "/api/improvement/candidates/workflow",
+        json={"trace_refs": [run["run_id"]]},
+    ).json()["data"]
+    assert workflow_payload["candidate"]["requires_human_approval"] is True
+    assert workflow_payload["candidate"]["evaluation_ids"]
+    assert len(workflow_payload["evaluations"]) == 2
+    assert workflow_payload["candidate"]["metrics"]["proposal_summary"]
+    assert workflow_payload["gate"]["approval_required"] is True
+
+
+def test_candidate_gate_blocks_multi_agent_handoff_and_dispatch_regressions():
+    candidate = {
+        "candidate_id": "candidate_test",
+        "kind": "policy",
+        "approved": True,
+    }
+    replay = EvaluationReport(
+        evaluation_id="eval_replay_ok",
+        candidate_id="candidate_test",
+        suite="replay",
+        status="passed",
+        success_rate=1.0,
+        safety_score=1.0,
+        recovery_score=1.0,
+        regression_count=0,
+        metrics={},
+        trace_refs=["run_1"],
+        created_at=datetime.now(timezone.utc).isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    benchmark = EvaluationReport(
+        evaluation_id="eval_benchmark_fail",
+        candidate_id="candidate_test",
+        suite="benchmark",
+        status="failed",
+        success_rate=0.5,
+        safety_score=0.6,
+        recovery_score=0.4,
+        regression_count=2,
+        bucket_results=[
+            BenchmarkBucketResult(bucket="handoff_chain", total=1, passed=0, failed=1, coverage=1.0, regressions=["handoff stalled"]),
+            BenchmarkBucketResult(bucket="review_gate", total=1, passed=1, failed=0, coverage=1.0, regressions=[]),
+            BenchmarkBucketResult(bucket="role_dispatch", total=1, passed=0, failed=1, coverage=1.0, regressions=["role dispatch regressed"]),
+            BenchmarkBucketResult(bucket="approval_sandbox", total=1, passed=1, failed=0, coverage=1.0, regressions=[]),
+        ],
+        hard_failures=[
+            EvaluationFailure(
+                kind="safety_regression",
+                severity="hard",
+                bucket="role_dispatch",
+                trace_ref="run_1",
+                summary="role dispatch regressed",
+            )
+        ],
+        metrics={},
+        trace_refs=["run_1"],
+        created_at=datetime.now(timezone.utc).isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    gate = harness_lab_services.improvement.evaluation_harness.candidate_gate(candidate, [replay, benchmark])
+    assert gate.publish_ready is False
+    assert any("handoff_chain" in blocker for blocker in gate.blockers)
+    assert any("role_dispatch" in blocker for blocker in gate.blockers)

@@ -11,17 +11,24 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from ..artifact_store import LocalFilesystemArtifactStore
 from ..boundary.gateway import ToolGateway
+from ..boundary.sandbox import SandboxManager
 from ..runtime.models import ModelRegistry
+from ..settings import HarnessLabSettings
 from ..types import (
+    ActionPlan,
     ArtifactRef,
     DispatchEnvelope,
+    KnowledgeReindexRequest,
+    KnowledgeSearchRequest,
     LeaseCompletionRequest,
     LeaseFailureRequest,
     LeaseReleaseRequest,
     ModelProfile,
     RecoveryEvent,
     ToolCallRecord,
+    ToolExecutionResult,
     WorkerEventBatch,
     WorkerEventRecord,
     WorkerHeartbeatRequest,
@@ -45,8 +52,9 @@ class _NoopConstraints:
 class LocalArtifactStore:
     def __init__(self, repo_root: Path, artifact_root: Optional[Path] = None) -> None:
         self.repo_root = repo_root
-        self.artifact_root = artifact_root or (repo_root / "backend" / "data" / "harness_lab" / "artifacts")
-        self.artifact_root.mkdir(parents=True, exist_ok=True)
+        resolved_root = artifact_root or (repo_root / "backend" / "data" / "harness_lab" / "artifacts")
+        self.artifact_root = resolved_root
+        self.backend = LocalFilesystemArtifactStore(resolved_root)
         self._created: list[ArtifactRef] = []
 
     def write_artifact_text(
@@ -57,17 +65,7 @@ class LocalArtifactStore:
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ArtifactRef:
-        artifact = ArtifactRef(
-            artifact_id=new_id("artifact"),
-            run_id=run_id,
-            artifact_type=artifact_type,
-            relative_path=str(Path(run_id) / artifact_type / filename),
-            metadata=metadata or {},
-            created_at=utc_now(),
-        )
-        absolute_path = self.artifact_root / artifact.relative_path
-        absolute_path.parent.mkdir(parents=True, exist_ok=True)
-        absolute_path.write_text(content, encoding="utf-8")
+        artifact = self.backend.write_text(run_id, artifact_type, filename, content, metadata)
         self._created.append(artifact)
         return artifact
 
@@ -94,6 +92,14 @@ class WorkerRuntimeClient:
 
     def get_worker(self, worker_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/workers/{worker_id}")
+
+    def drain_worker(self, worker_id: str, reason: Optional[str] = None) -> WorkerSnapshot:
+        payload = self._request("POST", f"/api/workers/{worker_id}/drain", {"reason": reason} if reason else {})
+        return WorkerSnapshot(**payload["data"])
+
+    def resume_worker(self, worker_id: str) -> WorkerSnapshot:
+        payload = self._request("POST", f"/api/workers/{worker_id}/resume", {})
+        return WorkerSnapshot(**payload["data"])
 
     def heartbeat_worker(self, worker_id: str, request: WorkerHeartbeatRequest) -> WorkerSnapshot:
         payload = self._request("POST", f"/api/workers/{worker_id}/heartbeat", request.model_dump(exclude_none=True))
@@ -122,6 +128,18 @@ class WorkerRuntimeClient:
 
     def get_run(self, run_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/runs/{run_id}")
+
+    def search_knowledge(self, request: KnowledgeSearchRequest) -> Dict[str, Any]:
+        return self._request("POST", "/api/knowledge/search", request.model_dump(exclude_none=True))
+
+    def fleet_status(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/fleet/status")
+
+    def queue_status(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/queues")
+
+    def reindex_knowledge(self, request: KnowledgeReindexRequest) -> Dict[str, Any]:
+        return self._request("POST", "/api/knowledge/reindex", request.model_dump(exclude_none=True))
 
     def _request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if self.request_fn:
@@ -161,7 +179,9 @@ class WorkerExecutionLoop:
             if env_artifact_root:
                 resolved_artifact_root = Path(env_artifact_root)
         self.artifact_store = LocalArtifactStore(self.repo_root, resolved_artifact_root)
-        self.tool_gateway = ToolGateway(self.artifact_store, _NoopConstraints())
+        self.settings = HarnessLabSettings.from_env()
+        self.sandbox_manager = SandboxManager(self.settings, self.artifact_store)
+        self.tool_gateway = ToolGateway(self.artifact_store, _NoopConstraints(), sandbox_manager=self.sandbox_manager)
         self.model_registry = model_registry or ModelRegistry()
 
     def register(
@@ -169,19 +189,25 @@ class WorkerExecutionLoop:
         worker_id: Optional[str] = None,
         label: str = "cli-worker",
         capabilities: Optional[list[str]] = None,
+        role_profile: Optional[str] = None,
         labels: Optional[list[str]] = None,
         version: str = "v1",
         execution_mode: str = "remote_http",
     ) -> WorkerSnapshot:
+        sandbox_status = self.sandbox_manager.status()
+        resolved_capabilities = capabilities or []
         return self.client.register_worker(
             WorkerRegisterRequest(
                 worker_id=worker_id,
                 label=label,
-                capabilities=capabilities or [],
+                capabilities=resolved_capabilities,
+                role_profile=role_profile,
                 hostname=socket.gethostname(),
                 pid=os.getpid(),
                 labels=labels or ["cli", "remote-worker"],
                 execution_mode=execution_mode,
+                sandbox_backend=sandbox_status.sandbox_backend,
+                sandbox_ready=sandbox_status.docker_ready and sandbox_status.sandbox_image_ready,
                 version=version,
             )
         )
@@ -191,6 +217,7 @@ class WorkerExecutionLoop:
         worker_id: Optional[str] = None,
         label: str = "cli-worker",
         capabilities: Optional[list[str]] = None,
+        role_profile: Optional[str] = None,
         labels: Optional[list[str]] = None,
         interval_seconds: Optional[float] = None,
         once: bool = False,
@@ -208,19 +235,30 @@ class WorkerExecutionLoop:
                 worker_id=worker_id,
                 label=label,
                 capabilities=capabilities,
+                role_profile=role_profile,
                 labels=labels,
                 execution_mode="remote_http",
             )
             worker_id = worker_snapshot.worker_id
+            worker = worker_snapshot.model_dump()
         else:
             worker_id = worker["worker_id"]
+        effective_role_profile = role_profile or worker.get("role_profile")
 
         handled = 0
         idle_cycles = 0
         while True:
+            sandbox_status = self.sandbox_manager.status()
             self.client.heartbeat_worker(
                 worker_id,
-                WorkerHeartbeatRequest(state="idle", lease_count=0, current_lease_id=None),
+                WorkerHeartbeatRequest(
+                    state="idle",
+                    lease_count=0,
+                    current_lease_id=None,
+                    role_profile=effective_role_profile,
+                    sandbox_backend=sandbox_status.sandbox_backend,
+                    sandbox_ready=sandbox_status.docker_ready and sandbox_status.sandbox_image_ready,
+                ),
             )
             response = self.client.poll_worker(worker_id, WorkerPollRequest(max_tasks=max(1, max_tasks)))
             if not response.dispatches:
@@ -231,7 +269,7 @@ class WorkerExecutionLoop:
                 continue
             idle_cycles = 0
             for dispatch in response.dispatches:
-                self._execute_dispatch(worker_id, dispatch)
+                self._execute_dispatch(worker_id, dispatch, effective_role_profile)
                 handled += 1
                 if max_dispatches is not None and handled >= max_dispatches:
                     return {"worker_id": worker_id, "handled_dispatches": handled}
@@ -239,7 +277,7 @@ class WorkerExecutionLoop:
                 return {"worker_id": worker_id, "handled_dispatches": handled}
         return {"worker_id": worker_id, "handled_dispatches": handled}
 
-    def _execute_dispatch(self, worker_id: str, dispatch: DispatchEnvelope) -> None:
+    def _execute_dispatch(self, worker_id: str, dispatch: DispatchEnvelope, role_profile: Optional[str]) -> None:
         self.client.heartbeat_worker(
             worker_id,
             WorkerHeartbeatRequest(
@@ -248,6 +286,11 @@ class WorkerExecutionLoop:
                 current_run_id=dispatch.run_id,
                 current_task_node_id=dispatch.task_node_id,
                 current_lease_id=dispatch.lease_id,
+                role_profile=role_profile,
+                sandbox_backend=self.settings.sandbox_backend,
+                sandbox_ready=not dispatch.requires_sandbox or (
+                    self.sandbox_manager.status().docker_ready and self.sandbox_manager.status().sandbox_image_ready
+                ),
             ),
         )
         stop_heartbeat = threading.Event()
@@ -255,7 +298,7 @@ class WorkerExecutionLoop:
         final_error: Optional[str] = None
         heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
-            args=(dispatch, stop_heartbeat),
+            args=(dispatch, stop_heartbeat, role_profile),
             daemon=True,
         )
         heartbeat_thread.start()
@@ -341,6 +384,9 @@ class WorkerExecutionLoop:
                     state=final_state,
                     lease_count=0,
                     current_lease_id=None,
+                    role_profile=None,
+                    sandbox_backend=self.settings.sandbox_backend,
+                    sandbox_ready=self.sandbox_manager.status().docker_ready and self.sandbox_manager.status().sandbox_image_ready,
                     last_error=final_error,
                 ),
             )
@@ -368,7 +414,11 @@ class WorkerExecutionLoop:
                 )
             ]
         else:
-            result = asyncio.run(self.tool_gateway.execute(dispatch.run_id, action))
+            if action.tool_name == "knowledge_search":
+                result = self._execute_remote_knowledge_search(dispatch)
+            else:
+                contextual_action = self._contextual_action(dispatch, action)
+                result = asyncio.run(self.tool_gateway.execute(dispatch.run_id, contextual_action))
             events = []
 
         tool_call = ToolCallRecord(
@@ -388,9 +438,25 @@ class WorkerExecutionLoop:
                     "tool_name": tool_call.tool_name,
                     "ok": tool_call.ok,
                     "error": tool_call.error,
+                    "sandboxed": isinstance(tool_call.output.get("sandbox_trace"), dict),
                 },
             )
         )
+        sandbox_trace = tool_call.output.get("sandbox_trace")
+        if isinstance(sandbox_trace, dict):
+            events.append(
+                WorkerEventRecord(
+                    event_type="sandbox.executed" if tool_call.ok else "sandbox.failed",
+                    payload={
+                        "worker_id": worker_id,
+                        "lease_id": dispatch.lease_id,
+                        "task_node_id": dispatch.task_node_id,
+                        "tool_name": tool_call.tool_name,
+                        "changed_paths": tool_call.output.get("changed_paths", []),
+                        "sandbox_trace": sandbox_trace,
+                    },
+                )
+            )
         artifacts = self.artifact_store.drain_artifacts()
         batch = WorkerEventBatch(
             lease_id=dispatch.lease_id,
@@ -414,10 +480,42 @@ class WorkerExecutionLoop:
         )
         return batch, result.ok, result.error
 
-    def _heartbeat_loop(self, dispatch: DispatchEnvelope, stop_signal: threading.Event) -> None:
+    def _execute_remote_knowledge_search(self, dispatch: DispatchEnvelope) -> ToolExecutionResult:
+        payload = dispatch.intent.suggested_action.payload
+        response = self.client.search_knowledge(
+            KnowledgeSearchRequest(
+                query=str(payload.get("query", dispatch.intent.intent)),
+                top_k=max(1, int(payload.get("top_k", 8) or 8)),
+                path_hint=str(payload.get("path_hint", "") or "") or None,
+                source_types=payload.get("source_types") or [],
+            )
+        )
+        result = response["data"]
+        artifact = self.artifact_store.write_artifact_text(
+            run_id=dispatch.run_id,
+            artifact_type="knowledge_search_results",
+            filename="execution_search_results.json",
+            content=json.dumps(result, ensure_ascii=False, indent=2),
+            metadata={
+                "query": result.get("query"),
+                "used_fallback": result.get("used_fallback"),
+                "source_coverage": result.get("source_coverage", {}),
+            },
+        )
+        result["artifact_id"] = artifact.artifact_id
+        result["results"] = result.get("hits", [])
+        return ToolExecutionResult(ok=True, output=result)
+
+    def _heartbeat_loop(
+        self,
+        dispatch: DispatchEnvelope,
+        stop_signal: threading.Event,
+        role_profile: Optional[str],
+    ) -> None:
         interval_seconds = max(1, dispatch.heartbeat_interval_seconds)
         while not stop_signal.wait(interval_seconds):
             try:
+                sandbox_status = self.sandbox_manager.status()
                 self.client.heartbeat_lease(
                     dispatch.lease_id,
                     WorkerHeartbeatRequest(
@@ -426,10 +524,22 @@ class WorkerExecutionLoop:
                         current_run_id=dispatch.run_id,
                         current_task_node_id=dispatch.task_node_id,
                         current_lease_id=dispatch.lease_id,
+                        role_profile=role_profile,
+                        sandbox_backend=sandbox_status.sandbox_backend,
+                        sandbox_ready=sandbox_status.docker_ready and sandbox_status.sandbox_image_ready,
                     ),
                 )
             except Exception:  # noqa: BLE001
                 return
+
+    @staticmethod
+    def _contextual_action(dispatch: DispatchEnvelope, action: ActionPlan) -> ActionPlan:
+        payload = dict(action.payload)
+        if dispatch.approval_token:
+            payload.setdefault("_approval_token", dispatch.approval_token)
+        if dispatch.sandbox_spec is not None:
+            payload.setdefault("_sandbox_spec", dispatch.sandbox_spec.model_dump())
+        return action.model_copy(update={"payload": payload})
 
     @staticmethod
     def _worker_model_profile(dispatch: DispatchEnvelope) -> ModelProfile:

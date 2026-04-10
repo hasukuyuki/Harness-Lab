@@ -25,7 +25,11 @@ class DispatchQueue:
         self.namespace = namespace
         self.client = redis.from_url(redis_url, decode_responses=True)
         self.ready_key = f"{namespace}:dispatch:ready"
+        self.shards_key = f"{namespace}:dispatch:ready:shards"
         self.lease_key = f"{namespace}:dispatch:lease_expiry"
+
+    def _ready_shard_key(self, shard: str) -> str:
+        return f"{self.ready_key}:{shard}"
 
     def ping(self) -> None:
         self.client.ping()
@@ -37,23 +41,74 @@ class DispatchQueue:
             return None
 
     def reset(self) -> None:
-        self.client.delete(self.ready_key, self.lease_key)
+        shard_keys = [self._ready_shard_key(shard) for shard in self.list_ready_shards()]
+        keys = [self.ready_key, self.shards_key, self.lease_key, *shard_keys]
+        self.client.delete(*keys)
 
-    def enqueue_ready_task(self, run_id: str, task_node_id: str, score: Optional[float] = None) -> None:
+    def enqueue_ready_task(
+        self,
+        run_id: str,
+        task_node_id: str,
+        score: Optional[float] = None,
+        shard: str = "default",
+    ) -> None:
+        ready_key = self._ready_shard_key(shard)
+        self.client.sadd(self.shards_key, shard)
         self.client.zadd(self.ready_key, {_task_ref(run_id, task_node_id): score or time.time()})
+        self.client.zadd(ready_key, {_task_ref(run_id, task_node_id): score or time.time()})
 
-    def requeue_ready_task(self, run_id: str, task_node_id: str, delay_seconds: float = 0.25) -> None:
-        self.enqueue_ready_task(run_id, task_node_id, score=time.time() + delay_seconds)
+    def requeue_ready_task(
+        self,
+        run_id: str,
+        task_node_id: str,
+        delay_seconds: float = 0.25,
+        shard: str = "default",
+    ) -> None:
+        self.enqueue_ready_task(run_id, task_node_id, score=time.time() + delay_seconds, shard=shard)
 
-    def pop_ready_task(self) -> Optional[Tuple[str, str]]:
-        items = self.client.zpopmin(self.ready_key, count=1)
-        if not items:
+    def pop_ready_task(self, shards: Optional[List[str]] = None) -> Optional[Tuple[str, str, str]]:
+        candidate_shards = shards or self.list_ready_shards()
+        if not candidate_shards:
             return None
-        member, _score = items[0]
-        return _decode_task_ref(member)
+        best: Optional[Tuple[str, str, float]] = None
+        for shard in candidate_shards:
+            items = self.client.zrange(self._ready_shard_key(shard), 0, 0, withscores=True)
+            if not items:
+                continue
+            member, score = items[0]
+            if best is None or score < best[2]:
+                best = (shard, member, float(score))
+        if best is None:
+            return None
+        shard, member, _score = best
+        removed = self.client.zrem(self._ready_shard_key(shard), member)
+        self.client.zrem(self.ready_key, member)
+        if not removed:
+            return self.pop_ready_task(shards=shards)
+        run_id, task_node_id = _decode_task_ref(member)
+        return run_id, task_node_id, shard
 
-    def ready_queue_depth(self) -> int:
+    def ready_queue_depth(self, shard: Optional[str] = None) -> int:
+        if shard:
+            return int(self.client.zcard(self._ready_shard_key(shard)))
         return int(self.client.zcard(self.ready_key))
+
+    def list_ready_shards(self) -> List[str]:
+        return sorted(str(item) for item in self.client.smembers(self.shards_key))
+
+    def queue_depth_by_shard(self) -> Dict[str, int]:
+        return {shard: self.ready_queue_depth(shard) for shard in self.list_ready_shards()}
+
+    def inspect_queues(self, limit: int = 5) -> List[Dict[str, object]]:
+        result: List[Dict[str, object]] = []
+        for shard in self.list_ready_shards():
+            members = self.client.zrange(self._ready_shard_key(shard), 0, max(0, limit - 1))
+            sample_tasks = [
+                {"run_id": run_id, "task_node_id": task_node_id}
+                for run_id, task_node_id in (_decode_task_ref(member) for member in members)
+            ]
+            result.append({"shard": shard, "depth": self.ready_queue_depth(shard), "sample_tasks": sample_tasks})
+        return result
 
     def track_lease_expiry(self, lease_id: str, expires_at_epoch: float) -> None:
         self.client.zadd(self.lease_key, {lease_id: expires_at_epoch})
@@ -75,6 +130,7 @@ class InMemoryDispatchQueue:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._ready: Dict[str, float] = {}
+        self._ready_shards: Dict[str, Dict[str, float]] = {}
         self._leases: Dict[str, float] = {}
 
     def ping(self) -> None:
@@ -86,26 +142,79 @@ class InMemoryDispatchQueue:
     def reset(self) -> None:
         with self._lock:
             self._ready.clear()
+            self._ready_shards.clear()
             self._leases.clear()
 
-    def enqueue_ready_task(self, run_id: str, task_node_id: str, score: Optional[float] = None) -> None:
+    def enqueue_ready_task(
+        self,
+        run_id: str,
+        task_node_id: str,
+        score: Optional[float] = None,
+        shard: str = "default",
+    ) -> None:
         with self._lock:
-            self._ready[_task_ref(run_id, task_node_id)] = score or time.time()
+            member = _task_ref(run_id, task_node_id)
+            self._ready[member] = score or time.time()
+            self._ready_shards.setdefault(shard, {})[member] = score or time.time()
 
-    def requeue_ready_task(self, run_id: str, task_node_id: str, delay_seconds: float = 0.25) -> None:
-        self.enqueue_ready_task(run_id, task_node_id, score=time.time() + delay_seconds)
+    def requeue_ready_task(
+        self,
+        run_id: str,
+        task_node_id: str,
+        delay_seconds: float = 0.25,
+        shard: str = "default",
+    ) -> None:
+        self.enqueue_ready_task(run_id, task_node_id, score=time.time() + delay_seconds, shard=shard)
 
-    def pop_ready_task(self) -> Optional[Tuple[str, str]]:
+    def pop_ready_task(self, shards: Optional[List[str]] = None) -> Optional[Tuple[str, str, str]]:
         with self._lock:
-            if not self._ready:
+            candidate_shards = shards or sorted(self._ready_shards.keys())
+            selected_shard: Optional[str] = None
+            selected_member: Optional[str] = None
+            selected_score: Optional[float] = None
+            for shard in candidate_shards:
+                ready = self._ready_shards.get(shard) or {}
+                if not ready:
+                    continue
+                member = min(ready, key=ready.get)
+                score = ready[member]
+                if selected_score is None or score < selected_score:
+                    selected_shard = shard
+                    selected_member = member
+                    selected_score = score
+            if selected_member is None or selected_shard is None:
                 return None
-            member = min(self._ready, key=self._ready.get)
-            self._ready.pop(member, None)
-        return _decode_task_ref(member)
+            self._ready.pop(selected_member, None)
+            shard_ready = self._ready_shards.get(selected_shard, {})
+            shard_ready.pop(selected_member, None)
+        run_id, task_node_id = _decode_task_ref(selected_member)
+        return run_id, task_node_id, selected_shard
 
-    def ready_queue_depth(self) -> int:
+    def ready_queue_depth(self, shard: Optional[str] = None) -> int:
         with self._lock:
+            if shard:
+                return len(self._ready_shards.get(shard, {}))
             return len(self._ready)
+
+    def list_ready_shards(self) -> List[str]:
+        with self._lock:
+            return sorted(self._ready_shards.keys())
+
+    def queue_depth_by_shard(self) -> Dict[str, int]:
+        with self._lock:
+            return {shard: len(items) for shard, items in sorted(self._ready_shards.items())}
+
+    def inspect_queues(self, limit: int = 5) -> List[Dict[str, object]]:
+        with self._lock:
+            result: List[Dict[str, object]] = []
+            for shard, ready in sorted(self._ready_shards.items()):
+                members = sorted(ready.items(), key=lambda item: item[1])[:limit]
+                sample_tasks = [
+                    {"run_id": run_id, "task_node_id": task_node_id}
+                    for run_id, task_node_id in (_decode_task_ref(member) for member, _ in members)
+                ]
+                result.append({"shard": shard, "depth": len(ready), "sample_tasks": sample_tasks})
+            return result
 
     def track_lease_expiry(self, lease_id: str, expires_at_epoch: float) -> None:
         with self._lock:

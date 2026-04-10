@@ -216,9 +216,14 @@ export interface RunDetail {
   data: ResearchRun
   session?: ResearchSession
   mission?: Mission | null
+  mission_phase?: Record<string, unknown>
+  handoffs?: Array<Record<string, unknown>>
+  review_verdicts?: Array<Record<string, unknown>>
+  role_timeline?: Array<Record<string, unknown>>
   coordination_snapshot?: Record<string, unknown>
   timeline_summary?: Record<string, unknown>
   status_summary?: Record<string, unknown>
+  sandbox_summary?: Record<string, unknown>
   active_policy?: HarnessPolicy | null
   workflow_template?: WorkflowTemplateVersion | null
   worker?: WorkerSnapshot | null
@@ -376,10 +381,18 @@ export interface PublishGateStatus {
 export interface FailureCluster {
   cluster_id: string
   signature: string
+  signature_type: string
   frequency: number
   affected_policies: string[]
   affected_workflows: string[]
   sample_run_ids: string[]
+  sample_task_node_ids: string[]
+  roles: string[]
+  handoff_pairs: string[]
+  review_decisions: string[]
+  tool_names: string[]
+  policy_decisions: string[]
+  sandbox_outcomes: string[]
   summary: string
   created_at: string
   updated_at: string
@@ -389,10 +402,14 @@ export interface WorkerSnapshot {
   worker_id: string
   label: string
   state: string
+  drain_state?: string
   capabilities: string[]
+  role_profile?: string | null
   hostname?: string | null
   pid?: number | null
   labels?: string[]
+  eligible_labels?: string[]
+  worker_class?: string
   execution_mode?: string
   heartbeat_at: string
   lease_count: number
@@ -428,6 +445,26 @@ export interface SettingsCatalog {
   tools: Array<Record<string, unknown>>
   model_provider?: Record<string, unknown>
   execution_plane?: Record<string, unknown>
+  sandbox?: Record<string, unknown>
+}
+
+export interface QueueShardStatus {
+  shard: string
+  depth: number
+  sample_tasks: Array<Record<string, string>>
+}
+
+export interface FleetStatusReport {
+  worker_count: number
+  active_workers: string[]
+  draining_workers: string[]
+  offline_workers: string[]
+  unhealthy_workers: string[]
+  workers_by_role: Record<string, number>
+  queue_depth_by_shard: Record<string, number>
+  lease_reclaim_rate: number
+  stuck_run_count: number
+  late_callback_count: number
 }
 
 export interface SessionRequest {
@@ -460,4 +497,7 @@ export interface CandidateCreationResponse {
   candidate: ImprovementCandidate
   version: HarnessPolicy | WorkflowTemplateVersion
   observations: Record<string, unknown>
+  diagnosis?: Record<string, unknown>
+  evaluations?: EvaluationReport[]
+  gate?: PublishGateStatus
 }

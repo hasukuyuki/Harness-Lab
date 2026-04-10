@@ -28,6 +28,7 @@ class OrchestratorService:
                     label=label,
                     kind=str(node_spec.get("kind") or "task"),
                     role=str(node_spec.get("role") or "executor"),
+                    agent_role=str(node_spec.get("role") or "executor"),
                     metadata={
                         "key": key,
                         "sequence": index,
@@ -73,6 +74,7 @@ class OrchestratorService:
                 label=label,
                 kind=kind,
                 role=role,
+                agent_role=role,
                 metadata={
                     "sequence": index,
                     "session_id": session.session_id,
@@ -144,7 +146,7 @@ class OrchestratorService:
         if edge.kind == "on_failure":
             return source.status == "failed"
         if edge.kind == "handoff":
-            return source.status in {"completed", "skipped"}
+            return source.status in {"completed", "failed", "skipped"}
         return source.status == "completed"
 
     @staticmethod
@@ -153,7 +155,7 @@ class OrchestratorService:
         if edge.kind == "on_failure":
             return source.status in {"completed", "skipped"}
         if edge.kind == "handoff":
-            return source.status == "failed"
+            return False
         return source.status in {"failed", "skipped"}
 
     @staticmethod

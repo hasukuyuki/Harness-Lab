@@ -15,6 +15,7 @@ from backend.app.harness_lab.control_plane.experiments import router as experime
 from backend.app.harness_lab.control_plane.evals import router as evals_router
 from backend.app.harness_lab.control_plane.failure_clusters import router as failure_clusters_router
 from backend.app.harness_lab.control_plane.intent import router as intent_router
+from backend.app.harness_lab.control_plane.knowledge import router as knowledge_router
 from backend.app.harness_lab.control_plane.leases import router as leases_router
 from backend.app.harness_lab.control_plane.policies import router as policies_router
 from backend.app.harness_lab.control_plane.prompts import router as prompts_router
@@ -75,6 +76,7 @@ app.add_middleware(
 
 app.include_router(sessions_router)
 app.include_router(intent_router)
+app.include_router(knowledge_router)
 app.include_router(context_router)
 app.include_router(prompts_router)
 app.include_router(constraints_router)

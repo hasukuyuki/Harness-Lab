@@ -10,16 +10,19 @@
 - 分层 Context 组装与 Prompt 构建
 - 约束策略与审批门控
 - 可回放的执行追踪
-- Worker 租约协议框架
+- Worker 租约协议（poll/heartbeat/complete/reclaim 完整链路）
+- Docker 沙箱执行（shell/git/write_file 等高风险操作容器化）
+- Postgres + Redis 存储层（已 smoke-tested）
 - 离线评估与发布门控
 - Mission Control Web UI (React + Ant Design)
+- 多 Agent 编排（role-aware，支持 handoff 和 review）
 
 ### 当前限制 ⚠️
-- 单用户本地模式（SQLite）
-- 沙箱化仍是本地 workspace 保护
-- 自然语言约束通过启发式解析
-- 多 agent 角色自主仅部分实现
+- 单用户本地控制平面（非多租户）
+- 沙箱是单主机 Docker，非生产级 microVM/隔离
+- 自然语言约束仍使用启发式解析，非语义规则编译
 - knowledge_search 工具待完善
+- 自改进循环优化 policy/workflow 版本，未触及平台源代码
 
 ---
 
@@ -79,15 +82,15 @@ curl -X POST http://localhost:4600/api/sessions \
 
 | 任务 | 依赖 | 难度 | 建议 |
 |------|------|------|------|
-| Postgres + Redis 存储层 | SQLAlchemy 已引入 | 中 | 先评估 SQLite 是否真的不够用 |
+| ~~Postgres + Redis 存储层~~ | ✅ 已完成 | - | 已迁移并 smoke-tested |
 | 容器化沙箱执行 | Docker SDK | 高 | 优先解决安全问题 |
 | 多用户/权限系统 | JWT + RBAC | 中 | 如需对外提供服务再考虑 |
 | 真正的多 Agent 协作 | 角色定义 + 协作协议 | 高 | 最后做，架构最复杂 |
 
-**关于存储层的建议：**
-- 当前 SQLite 对个人使用已经足够
-- 迁移到 Postgres 的时机：需要多实例部署、或数据量 > 10GB
-- Redis 可用于：Worker 心跳、实时事件流、分布式锁
+**存储层状态：**
+- ✅ Postgres：主存储，已配置并测试
+- ✅ Redis：用于事件流、lease 过期追踪、dispatch queue
+- ⚠️ 当前仅单实例部署，多实例扩展需后续工作
 
 ---
 
@@ -202,6 +205,9 @@ hlab config                          # 查看/修改配置
 1. **放弃了 n8n**：改为自研的 Harness 架构，更适合研究型 workflow
 2. **简化了模型栈**：当前只用 DeepSeek API，未接入本地 Qwen
 3. **增强了可观测性**：Replay、Trace、Eval 是原 PRD 未覆盖的
+4. **存储层升级**：从 SQLite 迁移到 Postgres + Redis
+5. **执行层隔离**：从本地执行升级到 Docker 沙箱
+6. **Worker 协议**：从概念框架到完整实现的 poll/heartbeat/complete/reclaim 协议
 
 ---
 
