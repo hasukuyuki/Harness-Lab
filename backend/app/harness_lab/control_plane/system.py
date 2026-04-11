@@ -13,10 +13,12 @@ async def settings_catalog():
     execution = harness_lab_services.runtime.execution_plane_status()
     knowledge = harness_lab_services.knowledge.status()
     artifacts = harness_lab_services.database.artifact_status()
+    constraint_status = harness_lab_services.constraint_engine.get_engine_status()
     return {
         "success": True,
         "data": {
             "constraints": [item.model_dump() for item in harness_lab_services.constraint_engine.list_documents()],
+            "constraint_engine": constraint_status.model_dump(),
             "context_profiles": [item.model_dump() for item in harness_lab_services.runtime.list_context_profiles()],
             "prompt_templates": [item.model_dump() for item in harness_lab_services.runtime.list_prompt_templates()],
             "model_profiles": [item.model_dump() for item in harness_lab_services.runtime.list_model_profiles()],
@@ -42,6 +44,7 @@ async def settings_catalog():
             "artifact_store": artifacts.model_dump(),
             "execution_plane": execution,
             "sandbox": harness_lab_services.sandbox.status().model_dump(),
+            "constraint_engine": constraint_status.model_dump(),
         },
     }
 
@@ -52,6 +55,7 @@ async def health():
     execution = doctor["execution_plane"]
     knowledge = doctor["knowledge"]
     artifacts = doctor["artifacts"]
+    constraint_status = harness_lab_services.constraint_engine.get_engine_status()
     return {
         "success": True,
         "data": {
@@ -113,6 +117,12 @@ async def health():
             "sandbox_failures": execution["sandbox_failures"],
             "sandbox_fallback_mode": execution["sandbox_fallback_mode"],
             "sandbox_last_probe_error": execution["sandbox_last_probe_error"],
+            "constraint_engine_version": constraint_status.constraint_engine_version,
+            "constraint_parser_ready": constraint_status.constraint_parser_ready,
+            "constraint_compiler_ready": constraint_status.constraint_compiler_ready,
+            "constraint_fallback_mode": constraint_status.constraint_fallback_mode,
+            "published_constraint_count": constraint_status.published_constraint_count,
+            "total_constraint_count": constraint_status.total_constraint_count,
         },
     }
 

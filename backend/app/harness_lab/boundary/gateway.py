@@ -103,8 +103,28 @@ class ToolGateway:
     def list_tools(self) -> List[ToolDescriptor]:
         return self._descriptors
 
-    def preflight(self, action: ActionPlan, constraint_set_id: str) -> List[PolicyVerdict]:
-        return self.constraints.verify(action.subject, action.payload, constraint_set_id)
+    def preflight(self, action: ActionPlan, constraint_set_id: str) -> Dict[str, Any]:
+        """Run preflight checks and return verdicts with explanation.
+        
+        Returns a dict containing:
+        - verdicts: List of PolicyVerdict
+        - final_verdict: The consolidated verdict
+        - explanation: Detailed ConstraintExplanation
+        - used_fallback: Whether fallback logic was used
+        """
+        response = self.constraints.verify(
+            subject=action.subject,
+            payload=action.payload,
+            constraint_set_id=constraint_set_id,
+        )
+        return {
+            "verdicts": response.verdicts,
+            "final_verdict": response.final_verdict,
+            "explanation": response.explanation,
+            "used_fallback": response.used_fallback,
+            "compiled_rule_count": response.compiled_rule_count,
+            "matched_rules": response.matched_rules,
+        }
 
     def model_reflection_result(self, reflection: Dict[str, Any]) -> ToolExecutionResult:
         return ToolExecutionResult(ok=True, output=reflection)

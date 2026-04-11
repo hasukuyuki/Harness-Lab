@@ -276,8 +276,10 @@ class RuntimeService:
             blocks=blocks,
             truncated_blocks=summary["truncated_blocks"],
         )
-        verdicts = self.tool_gateway.preflight(session.intent_declaration.suggested_action, session.constraint_set_id)
-        final_verdict = self.constraint_engine.final_verdict(verdicts)
+        preflight_result = self.tool_gateway.preflight(session.intent_declaration.suggested_action, session.constraint_set_id)
+        verdicts = preflight_result["verdicts"]
+        final_verdict = preflight_result["final_verdict"]
+        constraint_explanation = preflight_result["explanation"]
 
         artifacts = [
             self.tool_gateway.create_snapshot_manifest(run_id),
@@ -380,10 +382,32 @@ class RuntimeService:
         )
         self.database.append_event(
             "policy.preflight",
-            {"subject": final_verdict.subject, "decision": final_verdict.decision, "matched_rule": final_verdict.matched_rule},
+            {
+                "subject": final_verdict.subject,
+                "decision": final_verdict.decision,
+                "matched_rule": final_verdict.matched_rule,
+                "rule_id": final_verdict.rule_id,
+                "used_fallback": preflight_result["used_fallback"],
+                "compiled_rule_count": preflight_result["compiled_rule_count"],
+            },
             session_id=session.session_id,
             run_id=run_id,
         )
+        
+        # Store constraint explanation snapshot for replay/diagnosis
+        constraint_snapshot = self.database.write_artifact_text(
+            run_id=run_id,
+            artifact_type="constraint_explanation",
+            filename="constraint_explanation.json",
+            content=json.dumps(constraint_explanation.model_dump(), ensure_ascii=False, indent=2),
+            metadata={
+                "subject": final_verdict.subject,
+                "decision": final_verdict.decision,
+                "used_fallback": preflight_result["used_fallback"],
+                "matched_rule_count": len(preflight_result["matched_rules"]),
+            },
+        )
+        artifacts.append(constraint_snapshot)
         self.database.append_event(
             "mission.created",
             {"mission_id": mission.mission_id, "run_id": run.run_id, "status": mission.status},

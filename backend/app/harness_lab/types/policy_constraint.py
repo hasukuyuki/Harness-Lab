@@ -13,6 +13,38 @@ from .base import (
 )
 
 
+class ConstraintMatch(BaseModel):
+    """Result of matching a single rule against a context."""
+    rule_id: str
+    matched: bool
+    condition_results: List[Dict[str, Any]] = Field(default_factory=list)
+    context_snapshot: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MatchedRuleInfo(BaseModel):
+    """Information about a matched rule for explanation purposes."""
+    rule_id: str
+    subject_pattern: str
+    decision: VerdictDecision
+    priority: int
+    matched_conditions: List[str] = Field(default_factory=list)
+    reason: str
+
+
+class ConstraintExplanation(BaseModel):
+    """Detailed explanation of constraint evaluation."""
+    subject: str
+    final_decision: VerdictDecision
+    final_reason: str
+    matched_rules: List[MatchedRuleInfo] = Field(default_factory=list)
+    evaluated_rules: int = 0
+    used_fallback: bool = False
+    fallback_reason: Optional[str] = None
+    compilation_status: str = "not_compiled"  # success, partial, failed, not_compiled
+    compiled_rule_count: int = 0
+    context_snapshot: Dict[str, Any] = Field(default_factory=dict)
+
+
 class PolicyVerdict(BaseModel):
     """Verdict from policy constraint evaluation."""
     verdict_id: str
@@ -21,6 +53,29 @@ class PolicyVerdict(BaseModel):
     reason: str
     matched_rule: str
     created_at: str
+    # Enhanced fields for semantic constraints
+    rule_id: Optional[str] = None  # Stable rule identifier
+    used_fallback: bool = False  # Whether this verdict used fallback logic
+    explanation_summary: Optional[str] = None  # Human-readable summary
+
+
+class ConstraintCompileSummary(BaseModel):
+    """Summary of constraint compilation status."""
+    status: str = "not_compiled"  # success, partial, failed, not_compiled
+    compiled_at: Optional[str] = None
+    rule_count: int = 0
+    errors: List[str] = Field(default_factory=list)
+    used_fallback: bool = False
+
+
+class ConstraintCompileResult(BaseModel):
+    """Result of constraint compilation."""
+    document_id: str
+    status: str  # success, partial, failed
+    rules_compiled: int
+    errors: List[str] = Field(default_factory=list)
+    used_fallback: bool = False
+    fallback_reason: Optional[str] = None
 
 
 class ConstraintDocument(BaseModel):
@@ -36,6 +91,8 @@ class ConstraintDocument(BaseModel):
     version: str = "v1"
     created_at: str
     updated_at: str
+    # Extended payload field for compiled rules (stored in payload_json)
+    compiled: Optional[ConstraintCompileSummary] = None
 
 
 class ContextProfile(BaseModel):
@@ -138,6 +195,16 @@ class ConstraintVerifyRequest(BaseModel):
     constraint_set_id: Optional[str] = None
 
 
+class ConstraintVerifyResponse(BaseModel):
+    """Enhanced response for constraint verification."""
+    verdicts: List[PolicyVerdict]
+    final_verdict: PolicyVerdict
+    explanation: ConstraintExplanation
+    compiled_rule_count: int
+    used_fallback: bool
+    matched_rules: List[MatchedRuleInfo]
+
+
 class PolicyCompareRequest(BaseModel):
     """Request to compare policies."""
     policy_ids: List[str] = Field(default_factory=list)
@@ -151,3 +218,72 @@ class WorkflowCompareRequest(BaseModel):
 class ApprovalDecisionRequest(BaseModel):
     """Request to make an approval decision."""
     decision: ApprovalDecision
+
+
+class ConstraintEngineStatus(BaseModel):
+    """Status of the constraint engine for health endpoints."""
+    constraint_engine_version: str = "v2"
+    constraint_parser_ready: bool = True
+    constraint_compiler_ready: bool = True
+    constraint_fallback_mode: bool = False
+    published_constraint_count: int = 0
+    total_constraint_count: int = 0
+
+
+class RuleCondition(BaseModel):
+    """A single condition within a constraint rule."""
+    field: str  # tool_name, action, path, command, network_mode, etc.
+    operator: str  # eq, ne, contains, prefix, suffix, regex, in, not_in
+    value: Any
+    description: Optional[str] = None
+
+
+class ConstraintRule(BaseModel):
+    """A standardized constraint rule."""
+    rule_id: str
+    source_document_id: str
+    subject_pattern: str
+    conditions: List[RuleCondition] = Field(default_factory=list)
+    decision: VerdictDecision
+    priority: int = 50
+    reason_template: str
+    tags: List[str] = Field(default_factory=list)
+    created_at: str
+    
+    def render_reason(self, context: Dict[str, Any]) -> str:
+        """Render the reason template with runtime context."""
+        try:
+            return self.reason_template.format(**context)
+        except (KeyError, ValueError):
+            return self.reason_template
+
+
+class CompiledConstraintSet(BaseModel):
+    """A compiled set of constraint rules derived from a ConstraintDocument."""
+    compiled_at: str
+    document_id: str
+    document_version: str
+    rules: List[ConstraintRule] = Field(default_factory=list)
+    compilation_status: str = "success"  # success, partial, failed
+    compilation_errors: List[str] = Field(default_factory=list)
+    used_fallback: bool = False
+    fallback_reason: Optional[str] = None
+    
+    def get_rules_for_subject(self, subject: str) -> List[ConstraintRule]:
+        """Get all rules that match the given subject."""
+        matching = []
+        for rule in self.rules:
+            # Simple glob-style matching
+            pattern = rule.subject_pattern
+            if pattern == subject:
+                matching.append(rule)
+            elif pattern.endswith(".*") and subject.startswith(pattern[:-1]):
+                matching.append(rule)
+            elif pattern == "*":
+                matching.append(rule)
+            elif "*" in pattern:
+                # Convert simple glob to prefix/suffix matching
+                parts = pattern.split("*")
+                if len(parts) == 2 and subject.startswith(parts[0]) and subject.endswith(parts[1]):
+                    matching.append(rule)
+        return sorted(matching, key=lambda r: r.priority)
