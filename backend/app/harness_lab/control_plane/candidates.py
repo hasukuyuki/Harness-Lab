@@ -4,9 +4,11 @@ from fastapi import APIRouter, HTTPException
 
 from ..bootstrap import harness_lab_services
 from ..types import (
+    AnalyzeRolloutRequest,
     CanaryStartRequest,
     CanaryPromoteRequest,
     CanaryRollbackRequest,
+    CohortFilterRequest,
     ImprovementDiagnoseRequest,
     PolicyCandidateRequest,
     WorkflowCandidateRequest,
@@ -158,6 +160,9 @@ async def promote_canary(candidate_id: str, request: CanaryPromoteRequest):
         - No success rate regression > 10%
         - No safety score regression > 5%
         - Workflow candidates require human approval
+        
+    Note: Even if recommendation suggests HOLD, you can still promote with force=True
+    after reviewing the blockers.
     """
     try:
         candidate = harness_lab_services.improvement.promote_canary(
@@ -166,3 +171,45 @@ async def promote_canary(candidate_id: str, request: CanaryPromoteRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"success": True, "data": candidate.model_dump()}
+
+
+@router.get("/candidates/{candidate_id}/cohorts")
+async def get_cohort_runs(candidate_id: str, cohort: Optional[str] = None):
+    """Get runs filtered by cohort for a canary candidate.
+    
+    Args:
+        candidate_id: The candidate ID
+        cohort: Filter by cohort - "baseline", "canary", or omit for all
+        
+    Returns:
+        Runs with their cohort assignment and rollout metadata
+    """
+    try:
+        response = harness_lab_services.improvement.get_cohort_runs(candidate_id, cohort)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"success": True, "data": response.model_dump()}
+
+
+@router.post("/candidates/{candidate_id}/analyze-rollout")
+async def analyze_rollout(candidate_id: str, request: AnalyzeRolloutRequest):
+    """Analyze canary rollout and generate promotion recommendation.
+    
+    This endpoint performs online analysis of the canary rollout:
+    - Collects metrics from baseline and canary cohorts
+    - Calculates success/safety/recovery deltas
+    - Checks key bucket coverage (handoff, review, approval_sandbox, role_dispatch)
+    - Generates promote/hold/rollback recommendation with reasoning
+    
+    Args:
+        candidate_id: The candidate in canary status
+        request: Analysis options (force_recalculate, analysis_window_hours)
+        
+    Returns:
+        Comprehensive analysis with recommendation and cohort summaries
+    """
+    try:
+        response = await harness_lab_services.improvement.analyze_rollout(candidate_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "data": response.model_dump()}

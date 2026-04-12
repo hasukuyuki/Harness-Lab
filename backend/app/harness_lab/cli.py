@@ -127,6 +127,10 @@ def build_parser() -> argparse.ArgumentParser:
     canary_promote.add_argument("candidate_id")
     canary_promote.add_argument("--force", action="store_true", help="Force promotion (skip safety checks)")
 
+    canary_analyze = canary_subparsers.add_parser("analyze", help="Analyze canary rollout and generate recommendation")
+    canary_analyze.add_argument("candidate_id")
+    canary_analyze.add_argument("--window-hours", type=int, default=None, help="Analysis time window in hours")
+
     subparsers.add_parser("approvals", help="List approval inbox")
     leases = subparsers.add_parser("leases", help="List worker leases")
     leases.add_argument("--status", default="")
@@ -407,6 +411,42 @@ def main() -> None:
                     }, args.output_format)
                 except ValueError:
                     _emit({"error": str(exc)}, args.output_format)
+                raise SystemExit(1) from exc
+            return
+
+        if args.canary_command == "analyze":
+            import asyncio
+            try:
+                response = asyncio.run(
+                    harness_lab_services.improvement.analyze_rollout(args.candidate_id)
+                )
+                if args.output_format == "text":
+                    # Format a nice human-readable analysis
+                    rec = response.recommendation
+                    metrics = response.canary_metrics
+                    _emit({
+                        "candidate_id": response.candidate_id,
+                        "analyzed_at": response.analyzed_at,
+                        "recommendation": rec.recommendation.upper(),
+                        "confidence": f"{rec.confidence:.0%}",
+                        "reason": rec.reason_summary,
+                        "blockers": rec.blockers,
+                        "samples": {
+                            "baseline": metrics.baseline_sample_size,
+                            "canary": metrics.canary_sample_size,
+                        },
+                        "deltas": {
+                            "success": f"{metrics.success_delta:+.1%}",
+                            "safety": f"{metrics.safety_delta:+.1%}",
+                            "recovery": f"{metrics.recovery_delta:+.1%}",
+                        },
+                        "regression_detected": metrics.regression_detected,
+                        "requires_operator_review": rec.requires_operator_review,
+                    }, args.output_format)
+                else:
+                    _emit(response.model_dump(), args.output_format)
+            except ValueError as exc:
+                _emit({"error": str(exc)}, args.output_format)
                 raise SystemExit(1) from exc
             return
 

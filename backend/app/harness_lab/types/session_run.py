@@ -87,6 +87,17 @@ class ExecutionTrace(BaseModel):
     updated_at: str
 
 
+class RolloutInfo(BaseModel):
+    """Rollout metadata for tracking canary/baseline cohort assignment."""
+    candidate_id: Optional[str] = None
+    target_version_id: Optional[str] = None
+    rollout_ring: Optional[str] = None  # baseline, candidate, default
+    cohort: Optional[str] = None  # baseline, canary
+    matched_scope: Optional[Dict[str, Any]] = None  # {type, value, description}
+    rollout_reason: Optional[str] = None  # e.g., "percentage_match", "session_tag", "explicit_override"
+    recorded_at: Optional[str] = None
+
+
 class ResearchSession(BaseModel):
     """A research session with goal and configuration."""
     session_id: str
@@ -103,6 +114,9 @@ class ResearchSession(BaseModel):
     intent_declaration: Optional["IntentDeclaration"] = None
     intent_model_call: Optional["ModelCallTrace"] = None
     task_graph: Optional[TaskGraph] = None
+    # Rollout tracking
+    rollout_info: Optional[RolloutInfo] = None
+    tags: List[str] = Field(default_factory=list)
     created_at: str
     updated_at: str
 
@@ -121,6 +135,9 @@ class ResearchRun(BaseModel):
     prompt_frame: Optional[PromptFrame] = None
     execution_trace: Optional[ExecutionTrace] = None
     result: Dict[str, Any] = Field(default_factory=dict)
+    # Rollout tracking - mirrors session but allows per-run granularity
+    rollout_info: Optional[RolloutInfo] = None
+    cohort: Optional[str] = None  # baseline, canary (deprecated: use rollout_info.cohort)
     created_at: str
     updated_at: str
 

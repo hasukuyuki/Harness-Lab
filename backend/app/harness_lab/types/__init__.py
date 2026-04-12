@@ -45,6 +45,7 @@ from .session_run import (
     TaskEdge,
     TaskGraph,
     ExecutionTrace,
+    RolloutInfo,
     ResearchSession,
     ResearchRun,
     ExperimentRun,
@@ -123,8 +124,12 @@ from .sandbox import (
 from .improvement import (
     ImprovementCandidate,
     CanaryScope,
+    BucketMetrics,
     CanaryMetrics,
     RolloutSnapshot,
+    RecommendationType,
+    RolloutRecommendation,
+    CohortSummary,
     EvaluationFailure,
     BenchmarkBucketResult,
     EvaluationSuiteManifest,
@@ -141,6 +146,10 @@ from .improvement import (
     CanaryPromoteRequest,
     CanaryRollbackRequest,
     RolloutStatusResponse,
+    CohortFilterRequest,
+    CohortRunsResponse,
+    AnalyzeRolloutRequest,
+    AnalyzeRolloutResponse,
 )
 
 # Knowledge types
@@ -211,6 +220,7 @@ __all__ = [
     "TaskEdge",
     "TaskGraph",
     "ExecutionTrace",
+    "RolloutInfo",
     "ResearchSession",
     "ResearchRun",
     "ExperimentRun",
@@ -277,8 +287,12 @@ __all__ = [
     # Improvement
     "ImprovementCandidate",
     "CanaryScope",
+    "BucketMetrics",
     "CanaryMetrics",
     "RolloutSnapshot",
+    "RecommendationType",
+    "RolloutRecommendation",
+    "CohortSummary",
     "EvaluationFailure",
     "BenchmarkBucketResult",
     "EvaluationSuiteManifest",
@@ -295,6 +309,10 @@ __all__ = [
     "CanaryPromoteRequest",
     "CanaryRollbackRequest",
     "RolloutStatusResponse",
+    "CohortFilterRequest",
+    "CohortRunsResponse",
+    "AnalyzeRolloutRequest",
+    "AnalyzeRolloutResponse",
     # Knowledge
     "KnowledgeSearchHit",
     "KnowledgeIndexStatus",

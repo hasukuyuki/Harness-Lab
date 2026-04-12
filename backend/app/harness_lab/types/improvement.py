@@ -14,21 +14,63 @@ class CanaryScope(BaseModel):
     description: Optional[str] = None
 
 
+class BucketMetrics(BaseModel):
+    """Metrics for a specific bucket (handoff, review, etc.)."""
+    bucket_name: str
+    baseline_count: int = 0
+    canary_count: int = 0
+    baseline_passed: int = 0
+    canary_passed: int = 0
+    baseline_failed: int = 0
+    canary_failed: int = 0
+    pass_rate_delta: float = 0.0
+    regression_detected: bool = False
+
+
 class CanaryMetrics(BaseModel):
-    """Metrics collected during canary rollout."""
+    """Metrics collected during canary rollout - supports long-term observation."""
+    # Sample sizes
     baseline_sample_size: int = 0
     canary_sample_size: int = 0
+    
+    # Core rates
     baseline_success_rate: float = 0.0
     canary_success_rate: float = 0.0
     baseline_safety_score: float = 0.0
     canary_safety_score: float = 0.0
     baseline_recovery_rate: float = 0.0
     canary_recovery_rate: float = 0.0
+    baseline_approval_rate: float = 0.0
+    canary_approval_rate: float = 0.0
+    baseline_repair_rate: float = 0.0
+    canary_repair_rate: float = 0.0
+    
+    # Deltas
     success_delta: float = 0.0
     safety_delta: float = 0.0
     recovery_delta: float = 0.0
+    approval_delta: float = 0.0
+    repair_delta: float = 0.0
+    
+    # Bucket-level metrics (handoff, review, approval_sandbox, role_dispatch)
+    bucket_metrics: List[BucketMetrics] = Field(default_factory=list)
+    
+    # Regression detection
     regression_detected: bool = False
+    regression_buckets: List[str] = Field(default_factory=list)
+    
+    # Sample sufficiency
     sufficient_sample: bool = False
+    minimum_sample_reached: bool = False
+    
+    # Timestamps for long-term observation
+    calculated_at: Optional[str] = None
+    analysis_window_start: Optional[str] = None
+    analysis_window_end: Optional[str] = None
+    
+    # Key blockers identified
+    top_blockers: List[str] = Field(default_factory=list)
+    failing_cohorts: List[str] = Field(default_factory=list)
 
 
 class RolloutSnapshot(BaseModel):
@@ -37,6 +79,8 @@ class RolloutSnapshot(BaseModel):
     scope: Optional[CanaryScope] = None
     baseline_version_id: Optional[str] = None
     canary_metrics: Optional[CanaryMetrics] = None
+    recommendation: Optional[str] = None  # promote, hold, rollback at snapshot time
+    recommendation_reason: Optional[str] = None
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
 
@@ -122,6 +166,41 @@ class EvaluationReport(BaseModel):
     updated_at: str
 
 
+class RecommendationType:
+    """Recommendation types for canary promotion decisions."""
+    PROMOTE = "promote"
+    HOLD = "hold"
+    ROLLBACK = "rollback"
+
+
+class RolloutRecommendation(BaseModel):
+    """Recommendation for canary promotion with structured reasoning."""
+    recommendation: str  # promote, hold, rollback
+    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+    reason_summary: str
+    blockers: List[str] = Field(default_factory=list)
+    metric_deltas: Dict[str, float] = Field(default_factory=dict)
+    failing_cohorts: List[str] = Field(default_factory=list)
+    representative_runs: List[str] = Field(default_factory=list)  # Run IDs
+    representative_clusters: List[str] = Field(default_factory=list)  # Cluster IDs
+    # Which key buckets are missing or under-represented
+    bucket_coverage_gaps: List[str] = Field(default_factory=list)
+    # Whether this recommendation requires operator attention
+    requires_operator_review: bool = False
+    generated_at: str
+
+
+class CohortSummary(BaseModel):
+    """Summary of a rollout cohort for UI/API display."""
+    cohort: str  # baseline, canary
+    sample_size: int
+    success_count: int
+    failure_count: int
+    success_rate: float
+    recent_runs: List[str] = Field(default_factory=list)  # Run IDs
+    top_blockers: List[str] = Field(default_factory=list)
+
+
 class PublishGateStatus(BaseModel):
     """Status of publish gate for a candidate."""
     candidate_id: str
@@ -138,6 +217,9 @@ class PublishGateStatus(BaseModel):
     latest_replay_evaluation_id: Optional[str] = None
     latest_benchmark_evaluation_id: Optional[str] = None
     canary_metrics: Optional[CanaryMetrics] = None
+    # Online learning additions
+    current_recommendation: Optional[RolloutRecommendation] = None
+    cohort_summaries: List[CohortSummary] = Field(default_factory=list)
 
 
 class FailureCluster(BaseModel):
@@ -236,3 +318,41 @@ class RolloutStatusResponse(BaseModel):
     promote_ready: bool = False
     rollback_ready: bool = True  # Can always rollback
     blockers: List[str] = Field(default_factory=list)
+    # Online learning additions
+    recommendation: Optional[RolloutRecommendation] = None
+    cohort_summary: List[CohortSummary] = Field(default_factory=list)
+    recent_blockers: List[str] = Field(default_factory=list)
+    last_analyzed_at: Optional[str] = None
+
+
+class CohortFilterRequest(BaseModel):
+    """Request to filter runs by cohort."""
+    candidate_id: str
+    cohort: Optional[str] = None  # baseline, canary, or None for all
+    include_metadata: bool = True
+
+
+class CohortRunsResponse(BaseModel):
+    """Response with runs filtered by cohort."""
+    candidate_id: str
+    cohort: Optional[str]
+    baseline_count: int
+    canary_count: int
+    runs: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class AnalyzeRolloutRequest(BaseModel):
+    """Request to analyze canary rollout and generate recommendation."""
+    candidate_id: str
+    force_recalculate: bool = False  # Ignore cached metrics
+    analysis_window_hours: Optional[int] = None  # Default: all available data
+
+
+class AnalyzeRolloutResponse(BaseModel):
+    """Response from rollout analysis."""
+    candidate_id: str
+    analyzed_at: str
+    canary_metrics: CanaryMetrics
+    recommendation: RolloutRecommendation
+    cohort_summary: List[CohortSummary]
+    recent_failing_runs: List[Dict[str, Any]] = Field(default_factory=list)

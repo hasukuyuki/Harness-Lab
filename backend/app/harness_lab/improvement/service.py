@@ -7,10 +7,16 @@ from typing import Any, Dict, List, Optional
 
 from .evaluation_harness import EvaluationHarnessService
 from .canary_service import CanaryRolloutService
+from .canary_analysis_service import CanaryAnalysisService
 from ..storage import HarnessLabDatabase
 from ..types import (
+    AnalyzeRolloutRequest,
+    AnalyzeRolloutResponse,
+    BucketMetrics,
     CanaryMetrics,
     CanaryScope,
+    CohortRunsResponse,
+    CohortSummary,
     EvaluationReport,
     EvaluationSuite,
     FailureCluster,
@@ -18,8 +24,11 @@ from ..types import (
     ImprovementDiagnosisReport,
     ImprovementCandidate,
     PublishGateStatus,
+    RecommendationType,
     ResearchRun,
     ReviewVerdict,
+    RolloutInfo,
+    RolloutRecommendation,
     RolloutSnapshot,
     RolloutStatusResponse,
     WorkflowTemplateVersion,
@@ -34,6 +43,7 @@ class ImprovementService:
         self.database = database
         self.evaluation_harness = EvaluationHarnessService(database)
         self.canary_service = CanaryRolloutService(database)
+        self.canary_analysis = CanaryAnalysisService(database)
 
     def list_workflows(self) -> List[WorkflowTemplateVersion]:
         rows = self.database.fetchall("SELECT payload_json FROM workflow_templates ORDER BY updated_at DESC")
@@ -359,11 +369,20 @@ class ImprovementService:
             target.status = "archived"
             target.updated_at = utc_now()
             self._persist_workflow(target)
-        # Create proper rollout snapshot
+        # Create proper rollout snapshot with recommendation at rollback time
         snapshot = self.canary_service.create_rollout_snapshot(candidate)
+        # Get current recommendation if in canary
+        if candidate.publish_status == "canary":
+            try:
+                import asyncio
+                analysis = asyncio.run(self.analyze_rollout(candidate.candidate_id))
+                snapshot.recommendation = analysis.recommendation.recommendation
+                snapshot.recommendation_reason = analysis.recommendation.reason_summary
+            except Exception:
+                pass  # Don't fail rollback if analysis fails
         candidate.rollout_snapshot = snapshot
         candidate.publish_status = "rolled_back"
-        candidate.metrics["rollback_snapshot"] = rollback_snapshot
+        candidate.metrics["rollback_snapshot"] = snapshot.model_dump()
         candidate.rollout_ring = "baseline"  # Reset to baseline
         candidate.updated_at = utc_now()
         self._persist_candidate(candidate)
@@ -503,28 +522,196 @@ class ImprovementService:
         session: Dict[str, Any],
         worker: Optional[Dict[str, Any]] = None,
         explicit_override: Optional[str] = None,
-    ) -> bool:
+    ) -> Tuple[bool, Optional[RolloutInfo]]:
         """Check if a request should use the canary version.
         
         This is called by the runtime to decide which version to use.
+        
+        Returns:
+            Tuple of (should_use_canary, rollout_info)
         """
         try:
             candidate = self.get_candidate(candidate_id)
         except ValueError:
-            return False
+            return False, None
         
         if candidate.publish_status != "canary":
-            return False
+            return False, None
         
         if candidate.rollout_scope is None:
-            return False
+            return False, None
         
-        return self.canary_service.canary_matches(
+        matches = self.canary_service.canary_matches(
             scope=candidate.rollout_scope,
             session=session,
             worker=worker,
             explicit_override=explicit_override,
         )
+        
+        if not matches:
+            return False, None
+        
+        # Build rollout info with reason
+        scope = candidate.rollout_scope
+        reason = self._determine_rollout_reason(scope, session, worker, explicit_override)
+        
+        rollout_info = RolloutInfo(
+            candidate_id=candidate.candidate_id,
+            target_version_id=candidate.target_version_id,
+            rollout_ring="candidate",
+            cohort="canary",
+            matched_scope={
+                "type": scope.scope_type,
+                "value": scope.scope_value,
+                "description": scope.description,
+            },
+            rollout_reason=reason,
+            recorded_at=utc_now(),
+        )
+        
+        return True, rollout_info
+    
+    def _determine_rollout_reason(
+        self,
+        scope: CanaryScope,
+        session: Dict[str, Any],
+        worker: Optional[Dict[str, Any]],
+        explicit_override: Optional[str],
+    ) -> str:
+        """Determine why this request matched the canary scope."""
+        if scope.scope_type == "explicit_override":
+            return "explicit_override"
+        if scope.scope_type == "percentage":
+            return "percentage_match"
+        if scope.scope_type == "session_tag":
+            return "session_tag_match"
+        if scope.scope_type == "worker_label":
+            return "worker_label_match"
+        if scope.scope_type == "goal_pattern":
+            return "goal_pattern_match"
+        return "unknown"
+
+    async def analyze_rollout(self, candidate_id: str) -> AnalyzeRolloutResponse:
+        """Analyze canary rollout and generate recommendation.
+        
+        This is the main entry point for online canary analysis.
+        """
+        candidate = self.get_candidate(candidate_id)
+        if candidate.publish_status != "canary":
+            raise ValueError(f"Candidate is not in canary status: {candidate.publish_status}")
+        
+        return await self.canary_analysis.analyze_rollout(candidate)
+
+    def get_cohort_runs(
+        self,
+        candidate_id: str,
+        cohort: Optional[str] = None,
+    ) -> CohortRunsResponse:
+        """Get runs filtered by cohort for a candidate.
+        
+        Args:
+            candidate_id: The candidate ID
+            cohort: Filter by cohort ("baseline", "canary", or None for all)
+            
+        Returns:
+            CohortRunsResponse with filtered runs
+        """
+        candidate = self.get_candidate(candidate_id)
+        
+        # Get all runs for the target (policy or workflow)
+        all_runs = self._list_runs_for_target(
+            target_id=candidate.target_id,
+            baseline_version_id=candidate.baseline_version_id,
+            target_version_id=candidate.target_version_id,
+        )
+        
+        # Filter by cohort
+        baseline_runs = []
+        canary_runs = []
+        
+        for run in all_runs:
+            run_cohort = self._get_run_cohort(run, candidate)
+            if run_cohort == "baseline":
+                baseline_runs.append(run)
+            elif run_cohort == "canary":
+                canary_runs.append(run)
+        
+        # Apply cohort filter if specified
+        if cohort == "baseline":
+            filtered_runs = baseline_runs
+        elif cohort == "canary":
+            filtered_runs = canary_runs
+        else:
+            filtered_runs = baseline_runs + canary_runs
+        
+        return CohortRunsResponse(
+            candidate_id=candidate_id,
+            cohort=cohort,
+            baseline_count=len(baseline_runs),
+            canary_count=len(canary_runs),
+            runs=[self._run_to_dict(r) for r in filtered_runs],
+        )
+    
+    def _list_runs_for_target(
+        self,
+        target_id: str,
+        baseline_version_id: Optional[str],
+        target_version_id: str,
+    ) -> List[ResearchRun]:
+        """List runs that involve a specific target (policy or workflow)."""
+        # Query all recent runs - this is a simplified version
+        # In production, you'd want to filter by target_id in the query
+        runs = self._list_runs()
+        
+        # Filter runs that used either baseline or canary version
+        filtered = []
+        for run in runs:
+            # Check if run used either version
+            if run.policy_id in {baseline_version_id, target_version_id}:
+                filtered.append(run)
+            elif run.workflow_template_id in {baseline_version_id, target_version_id}:
+                filtered.append(run)
+            # Also include runs with rollout_info matching this candidate
+            elif run.rollout_info and run.rollout_info.candidate_id == target_id:
+                filtered.append(run)
+        
+        return filtered
+    
+    def _get_run_cohort(
+        self,
+        run: ResearchRun,
+        candidate: ImprovementCandidate,
+    ) -> str:
+        """Determine which cohort a run belongs to."""
+        # Check explicit rollout_info first
+        if run.rollout_info:
+            return run.rollout_info.cohort or "baseline"
+        
+        # Check legacy cohort field
+        if run.cohort:
+            return run.cohort
+        
+        # Infer from version IDs
+        if run.policy_id == candidate.target_version_id:
+            return "canary"
+        if run.workflow_template_id == candidate.target_version_id:
+            return "canary"
+        
+        return "baseline"
+    
+    def _run_to_dict(self, run: ResearchRun) -> Dict[str, Any]:
+        """Convert run to dict for API response."""
+        return {
+            "run_id": run.run_id,
+            "session_id": run.session_id,
+            "status": run.status,
+            "policy_id": run.policy_id,
+            "workflow_template_id": run.workflow_template_id,
+            "cohort": run.cohort,
+            "rollout_info": run.rollout_info.model_dump() if run.rollout_info else None,
+            "created_at": run.created_at,
+            "updated_at": run.updated_at,
+        }
 
     def refresh_failure_clusters(self) -> List[FailureCluster]:
         runs = self._list_runs()
