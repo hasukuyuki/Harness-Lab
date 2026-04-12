@@ -6,18 +6,22 @@ from statistics import mean
 from typing import Any, Dict, List, Optional
 
 from .evaluation_harness import EvaluationHarnessService
+from .canary_service import CanaryRolloutService
 from ..storage import HarnessLabDatabase
 from ..types import (
+    CanaryMetrics,
+    CanaryScope,
     EvaluationReport,
     EvaluationSuite,
     FailureCluster,
     HarnessPolicy,
     ImprovementDiagnosisReport,
     ImprovementCandidate,
-    ResearchSession,
     PublishGateStatus,
     ResearchRun,
     ReviewVerdict,
+    RolloutSnapshot,
+    RolloutStatusResponse,
     WorkflowTemplateVersion,
 )
 from ..utils import compact_text, new_id, utc_now
@@ -29,6 +33,7 @@ class ImprovementService:
     def __init__(self, database: HarnessLabDatabase) -> None:
         self.database = database
         self.evaluation_harness = EvaluationHarnessService(database)
+        self.canary_service = CanaryRolloutService(database)
 
     def list_workflows(self) -> List[WorkflowTemplateVersion]:
         rows = self.database.fetchall("SELECT payload_json FROM workflow_templates ORDER BY updated_at DESC")
@@ -354,16 +359,172 @@ class ImprovementService:
             target.status = "archived"
             target.updated_at = utc_now()
             self._persist_workflow(target)
-        rollback_snapshot = {
-            "gate": self.evaluation_harness.candidate_gate(candidate.model_dump(), self._candidate_evaluations(candidate.candidate_id)).model_dump(),
-            "evaluations": [item.model_dump() for item in self._candidate_evaluations(candidate.candidate_id)],
-            "rolled_back_at": utc_now(),
-        }
+        # Create proper rollout snapshot
+        snapshot = self.canary_service.create_rollout_snapshot(candidate)
+        candidate.rollout_snapshot = snapshot
         candidate.publish_status = "rolled_back"
         candidate.metrics["rollback_snapshot"] = rollback_snapshot
+        candidate.rollout_ring = "baseline"  # Reset to baseline
         candidate.updated_at = utc_now()
         self._persist_candidate(candidate)
         return candidate
+
+    # =============================================================================
+    # Canary Rollout Methods
+    # =============================================================================
+
+    def start_canary(
+        self,
+        candidate_id: str,
+        scope: Optional[CanaryScope] = None,
+    ) -> ImprovementCandidate:
+        """Start canary rollout for a candidate.
+        
+        Args:
+            candidate_id: The candidate to start canary for
+            scope: Canary scope (defaults based on candidate kind)
+            
+        Returns:
+            The updated candidate
+        """
+        candidate = self.get_candidate(candidate_id)
+        
+        # Check if candidate is ready for canary
+        gate = self.get_candidate_gate(candidate_id)
+        if not gate.publish_ready:
+            raise ValueError(f"Candidate not ready for canary: {', '.join(gate.blockers)}")
+        
+        # Set default scope if not provided
+        if scope is None:
+            scope = self.canary_service.get_default_canary_scope(candidate.kind)
+        
+        # Update candidate for canary
+        candidate.publish_status = "canary"
+        candidate.rollout_ring = "candidate"
+        candidate.rollout_scope = scope
+        candidate.rollout_started_at = utc_now()
+        candidate.updated_at = utc_now()
+        
+        self._persist_candidate(candidate)
+        return candidate
+
+    def promote_canary(self, candidate_id: str, force: bool = False) -> ImprovementCandidate:
+        """Promote canary candidate to full published status.
+        
+        Args:
+            candidate_id: The candidate to promote
+            force: Skip safety checks (not recommended)
+            
+        Returns:
+            The updated candidate
+        """
+        candidate = self.get_candidate(candidate_id)
+        
+        if candidate.publish_status != "canary":
+            raise ValueError("Candidate is not in canary status")
+        
+        # Check promote readiness
+        if not force:
+            is_ready, blockers = self.canary_service.check_promote_readiness(candidate)
+            if not is_ready:
+                raise ValueError(f"Cannot promote: {', '.join(blockers)}")
+        
+        # Archive current published version
+        if candidate.kind == "policy":
+            self._archive_policies()
+            policy = self._get_policy(candidate.target_version_id)
+            policy.status = "published"
+            policy.updated_at = utc_now()
+            self._persist_policy(policy)
+        else:
+            self._archive_workflows()
+            workflow = self.get_workflow(candidate.target_version_id)
+            workflow.status = "published"
+            workflow.updated_at = utc_now()
+            self._persist_workflow(workflow)
+        
+        # Update candidate
+        candidate.publish_status = "published"
+        candidate.rollout_ring = "default"
+        candidate.updated_at = utc_now()
+        
+        self._persist_candidate(candidate)
+        return candidate
+
+    def get_rollout_status(self, candidate_id: str) -> RolloutStatusResponse:
+        """Get detailed rollout status for a candidate."""
+        candidate = self.get_candidate(candidate_id)
+        gate = self.get_candidate_gate(candidate_id)
+        
+        # Check promote readiness
+        promote_ready, blockers = self.canary_service.check_promote_readiness(candidate)
+        
+        return RolloutStatusResponse(
+            candidate_id=candidate.candidate_id,
+            publish_status=candidate.publish_status,
+            rollout_ring=candidate.rollout_ring,
+            rollout_scope=candidate.rollout_scope,
+            canary_metrics=candidate.canary_metrics,
+            gate_status=gate,
+            baseline_version_id=candidate.baseline_version_id,
+            target_version_id=candidate.target_version_id,
+            promote_ready=promote_ready,
+            rollback_ready=candidate.publish_status in {"canary", "published"},
+            blockers=blockers,
+        )
+
+    def update_canary_metrics(
+        self,
+        candidate_id: str,
+        baseline_runs: List[Dict[str, Any]],
+        canary_runs: List[Dict[str, Any]],
+    ) -> ImprovementCandidate:
+        """Update canary metrics for a candidate.
+        
+        This is typically called by a background job or evaluation.
+        """
+        candidate = self.get_candidate(candidate_id)
+        
+        metrics = self.canary_service.calculate_canary_metrics(
+            candidate_id=candidate_id,
+            baseline_runs=baseline_runs,
+            canary_runs=canary_runs,
+        )
+        
+        candidate.canary_metrics = metrics
+        candidate.updated_at = utc_now()
+        
+        self._persist_candidate(candidate)
+        return candidate
+
+    def should_use_canary(
+        self,
+        candidate_id: str,
+        session: Dict[str, Any],
+        worker: Optional[Dict[str, Any]] = None,
+        explicit_override: Optional[str] = None,
+    ) -> bool:
+        """Check if a request should use the canary version.
+        
+        This is called by the runtime to decide which version to use.
+        """
+        try:
+            candidate = self.get_candidate(candidate_id)
+        except ValueError:
+            return False
+        
+        if candidate.publish_status != "canary":
+            return False
+        
+        if candidate.rollout_scope is None:
+            return False
+        
+        return self.canary_service.canary_matches(
+            scope=candidate.rollout_scope,
+            session=session,
+            worker=worker,
+            explicit_override=explicit_override,
+        )
 
     def refresh_failure_clusters(self) -> List[FailureCluster]:
         runs = self._list_runs()

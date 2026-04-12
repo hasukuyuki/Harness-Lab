@@ -32,7 +32,28 @@ ApprovalDecision = Literal["approve", "deny", "approve_once"]
 ApprovalStatus = Literal["pending", "approved", "denied", "consumed"]
 ContextLayer = Literal["structure", "task", "history", "index"]
 CandidateKind = Literal["policy", "workflow"]
-CandidatePublishStatus = Literal["draft", "evaluating", "awaiting_approval", "publish_ready", "published", "rolled_back", "rejected"]
+CandidatePublishStatus = Literal[
+    "draft",
+    "evaluating",
+    "awaiting_approval",
+    "publish_ready",
+    "canary",          # In canary rollout phase
+    "published",       # Fully promoted to default
+    "rolled_back",     # Rolled back to baseline
+    "rejected",        # Failed evaluation
+]
+
+# Rollout ring definitions
+RolloutRing = Literal["baseline", "candidate", "default"]
+
+# Canary scope types
+CanaryScopeType = Literal[
+    "session_tag",
+    "worker_label",
+    "goal_pattern",
+    "explicit_override",
+    "percentage",
+]
 EvaluationStatus = Literal["pending", "passed", "failed"]
 EvaluationSuite = Literal["replay", "benchmark"]
 WorkerState = Literal["registering", "idle", "leased", "executing", "draining", "offline", "unhealthy"]

@@ -122,6 +122,9 @@ from .sandbox import (
 # Improvement types
 from .improvement import (
     ImprovementCandidate,
+    CanaryScope,
+    CanaryMetrics,
+    RolloutSnapshot,
     EvaluationFailure,
     BenchmarkBucketResult,
     EvaluationSuiteManifest,
@@ -134,6 +137,10 @@ from .improvement import (
     ImprovementDiagnoseRequest,
     EvaluationRequest,
     ExperimentRequest,
+    CanaryStartRequest,
+    CanaryPromoteRequest,
+    CanaryRollbackRequest,
+    RolloutStatusResponse,
 )
 
 # Knowledge types
@@ -269,6 +276,9 @@ __all__ = [
     "ToolCallRecord",
     # Improvement
     "ImprovementCandidate",
+    "CanaryScope",
+    "CanaryMetrics",
+    "RolloutSnapshot",
     "EvaluationFailure",
     "BenchmarkBucketResult",
     "EvaluationSuiteManifest",
@@ -281,6 +291,10 @@ __all__ = [
     "ImprovementDiagnoseRequest",
     "EvaluationRequest",
     "ExperimentRequest",
+    "CanaryStartRequest",
+    "CanaryPromoteRequest",
+    "CanaryRollbackRequest",
+    "RolloutStatusResponse",
     # Knowledge
     "KnowledgeSearchHit",
     "KnowledgeIndexStatus",

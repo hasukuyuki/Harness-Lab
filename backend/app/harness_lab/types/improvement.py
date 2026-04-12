@@ -7,6 +7,40 @@ from pydantic import BaseModel, Field
 from .base import CandidateKind, CandidatePublishStatus, EvaluationStatus, EvaluationSuite
 
 
+class CanaryScope(BaseModel):
+    """Scope definition for canary rollout."""
+    scope_type: str  # session_tag, worker_label, goal_pattern, explicit_override, percentage
+    scope_value: str
+    description: Optional[str] = None
+
+
+class CanaryMetrics(BaseModel):
+    """Metrics collected during canary rollout."""
+    baseline_sample_size: int = 0
+    canary_sample_size: int = 0
+    baseline_success_rate: float = 0.0
+    canary_success_rate: float = 0.0
+    baseline_safety_score: float = 0.0
+    canary_safety_score: float = 0.0
+    baseline_recovery_rate: float = 0.0
+    canary_recovery_rate: float = 0.0
+    success_delta: float = 0.0
+    safety_delta: float = 0.0
+    recovery_delta: float = 0.0
+    regression_detected: bool = False
+    sufficient_sample: bool = False
+
+
+class RolloutSnapshot(BaseModel):
+    """Snapshot of rollout state for rollback records."""
+    ring: str
+    scope: Optional[CanaryScope] = None
+    baseline_version_id: Optional[str] = None
+    canary_metrics: Optional[CanaryMetrics] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+
+
 class ImprovementCandidate(BaseModel):
     """Candidate improvement to policy or workflow."""
     candidate_id: str
@@ -20,6 +54,12 @@ class ImprovementCandidate(BaseModel):
     publish_status: CandidatePublishStatus = "draft"
     approved: bool = False
     requires_human_approval: bool = False
+    # Rollout fields
+    rollout_ring: Optional[str] = None  # baseline, candidate, default
+    rollout_scope: Optional[CanaryScope] = None
+    canary_metrics: Optional[CanaryMetrics] = None
+    rollout_started_at: Optional[str] = None
+    rollout_snapshot: Optional[RolloutSnapshot] = None  # For rollback records
     metrics: Dict[str, Any] = Field(default_factory=dict)
     evaluation_ids: List[str] = Field(default_factory=list)
     created_at: str
@@ -70,6 +110,12 @@ class EvaluationReport(BaseModel):
     hard_failures: List[EvaluationFailure] = Field(default_factory=list)
     soft_regressions: List[EvaluationFailure] = Field(default_factory=list)
     coverage_gaps: List[str] = Field(default_factory=list)
+    # Canary comparison fields
+    baseline_vs_canary: Optional[Dict[str, Any]] = None  # Direct comparison data
+    canary_sample_size: int = 0
+    canary_success_delta: float = 0.0
+    canary_safety_delta: float = 0.0
+    canary_repair_delta: float = 0.0
     metrics: Dict[str, Any] = Field(default_factory=dict)
     trace_refs: List[str] = Field(default_factory=list)
     created_at: str
@@ -84,9 +130,14 @@ class PublishGateStatus(BaseModel):
     approval_required: bool
     approval_satisfied: bool
     publish_ready: bool
+    canary_ready: bool = False  # Ready to enter canary
+    promote_ready: bool = False  # Ready to promote from canary to published
+    canary_blockers: List[str] = Field(default_factory=list)
+    promote_blockers: List[str] = Field(default_factory=list)
     blockers: List[str] = Field(default_factory=list)
     latest_replay_evaluation_id: Optional[str] = None
     latest_benchmark_evaluation_id: Optional[str] = None
+    canary_metrics: Optional[CanaryMetrics] = None
 
 
 class FailureCluster(BaseModel):
@@ -152,3 +203,36 @@ class ExperimentRequest(BaseModel):
     scenario_suite: str = "golden_trace"
     harness_ids: List[str] = Field(default_factory=list)
     trace_refs: List[str] = Field(default_factory=list)
+
+
+# Canary rollout request types
+class CanaryStartRequest(BaseModel):
+    """Request to start canary rollout."""
+    scope_type: str = "percentage"  # session_tag, worker_label, goal_pattern, explicit_override, percentage
+    scope_value: str = "10"  # For percentage: "10" means 10%
+    description: Optional[str] = None
+
+
+class CanaryPromoteRequest(BaseModel):
+    """Request to promote canary to published."""
+    force: bool = False  # Skip safety checks (not recommended)
+
+
+class CanaryRollbackRequest(BaseModel):
+    """Request to rollback canary."""
+    reason: Optional[str] = None
+
+
+class RolloutStatusResponse(BaseModel):
+    """Response for rollout status."""
+    candidate_id: str
+    publish_status: str
+    rollout_ring: Optional[str] = None
+    rollout_scope: Optional[CanaryScope] = None
+    canary_metrics: Optional[CanaryMetrics] = None
+    gate_status: Optional[PublishGateStatus] = None
+    baseline_version_id: Optional[str] = None
+    target_version_id: str
+    promote_ready: bool = False
+    rollback_ready: bool = True  # Can always rollback
+    blockers: List[str] = Field(default_factory=list)

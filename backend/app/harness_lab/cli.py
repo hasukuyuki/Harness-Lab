@@ -100,11 +100,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("candidates", help="List improvement candidates")
 
-    promote = subparsers.add_parser("promote", help="Publish a candidate")
+    promote = subparsers.add_parser("promote", help="Publish or promote a candidate")
     promote.add_argument("candidate_id")
+    promote.add_argument("--from-canary", action="store_true", help="Promote from canary to published")
+    promote.add_argument("--force", action="store_true", help="Force promotion (skip safety checks)")
 
     rollback = subparsers.add_parser("rollback", help="Rollback a candidate")
     rollback.add_argument("candidate_id")
+    rollback.add_argument("--reason", default="", help="Reason for rollback")
+
+    # Canary rollout commands
+    canary = subparsers.add_parser("canary", help="Manage canary rollouts")
+    canary_subparsers = canary.add_subparsers(dest="canary_command", required=True)
+
+    canary_start = canary_subparsers.add_parser("start", help="Start canary rollout for a candidate")
+    canary_start.add_argument("candidate_id")
+    canary_start.add_argument("--scope-type", default="percentage", 
+                              choices=["percentage", "session_tag", "worker_label", "goal_pattern", "explicit_override"],
+                              help="Type of canary scope")
+    canary_start.add_argument("--scope-value", default="10", help="Scope value (e.g., '10' for 10%)")
+    canary_start.add_argument("--description", default="", help="Description of the canary scope")
+
+    canary_subparsers.add_parser("status", help="List canary rollout status for all candidates")
+
+    canary_promote = canary_subparsers.add_parser("promote", help="Promote canary to full published status")
+    canary_promote.add_argument("candidate_id")
+    canary_promote.add_argument("--force", action="store_true", help="Force promotion (skip safety checks)")
 
     subparsers.add_parser("approvals", help="List approval inbox")
     leases = subparsers.add_parser("leases", help="List worker leases")
@@ -300,7 +321,10 @@ def main() -> None:
 
     if args.command == "promote":
         try:
-            candidate = harness_lab_services.improvement.publish_candidate(args.candidate_id)
+            if args.from_canary:
+                candidate = harness_lab_services.improvement.promote_canary(args.candidate_id, force=args.force)
+            else:
+                candidate = harness_lab_services.improvement.publish_candidate(args.candidate_id)
         except ValueError as exc:
             try:
                 gate = harness_lab_services.improvement.get_candidate_gate(args.candidate_id)
@@ -316,6 +340,75 @@ def main() -> None:
         candidate = harness_lab_services.improvement.rollback_candidate(args.candidate_id)
         _emit(candidate.model_dump(), args.output_format)
         return
+
+    if args.command == "canary":
+        if args.canary_command == "start":
+            from backend.app.harness_lab.types import CanaryScope
+            scope = CanaryScope(
+                scope_type=args.scope_type,
+                scope_value=args.scope_value,
+                description=args.description or f"Canary: {args.scope_type}={args.scope_value}",
+            )
+            try:
+                candidate = harness_lab_services.improvement.start_canary(args.candidate_id, scope)
+                _emit({
+                    "candidate_id": candidate.candidate_id,
+                    "publish_status": candidate.publish_status,
+                    "rollout_ring": candidate.rollout_ring,
+                    "rollout_scope": candidate.rollout_scope.model_dump() if candidate.rollout_scope else None,
+                }, args.output_format)
+            except ValueError as exc:
+                _emit({"error": str(exc)}, args.output_format)
+                raise SystemExit(1) from exc
+            return
+
+        if args.canary_command == "status":
+            candidates = harness_lab_services.improvement.list_candidates()
+            canary_candidates = [c for c in candidates if c.publish_status in {"canary", "published"} and c.rollout_ring]
+            if args.output_format == "text":
+                _emit(
+                    [
+                        {
+                            "candidate_id": item.candidate_id,
+                            "kind": item.kind,
+                            "publish_status": item.publish_status,
+                            "rollout_ring": item.rollout_ring,
+                            "scope_type": item.rollout_scope.scope_type if item.rollout_scope else None,
+                            "scope_value": item.rollout_scope.scope_value if item.rollout_scope else None,
+                            "canary_sample_size": item.canary_metrics.canary_sample_size if item.canary_metrics else 0,
+                            "sufficient_sample": item.canary_metrics.sufficient_sample if item.canary_metrics else False,
+                            "regression_detected": item.canary_metrics.regression_detected if item.canary_metrics else False,
+                        }
+                        for item in canary_candidates
+                    ],
+                    args.output_format,
+                )
+            else:
+                _emit([item.model_dump() for item in canary_candidates], args.output_format)
+            return
+
+        if args.canary_command == "promote":
+            try:
+                candidate = harness_lab_services.improvement.promote_canary(args.candidate_id, force=args.force)
+                _emit({
+                    "candidate_id": candidate.candidate_id,
+                    "publish_status": candidate.publish_status,
+                    "rollout_ring": candidate.rollout_ring,
+                    "promoted_at": candidate.updated_at,
+                }, args.output_format)
+            except ValueError as exc:
+                # Get rollout status for detailed blockers
+                try:
+                    status = harness_lab_services.improvement.get_rollout_status(args.candidate_id)
+                    _emit({
+                        "error": str(exc),
+                        "blockers": status.blockers,
+                        "canary_metrics": status.canary_metrics.model_dump() if status.canary_metrics else None,
+                    }, args.output_format)
+                except ValueError:
+                    _emit({"error": str(exc)}, args.output_format)
+                raise SystemExit(1) from exc
+            return
 
     if args.command == "approvals":
         _emit([item.model_dump() for item in harness_lab_services.runtime.list_approvals()], args.output_format)
