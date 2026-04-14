@@ -119,6 +119,8 @@ class DispatchEnvelope(BaseModel):
     heartbeat_interval_seconds: int = 10
     run_status_hint: Optional[str] = None
     created_at: str
+    # Backend hint for executor selection (e.g., "docker", "microvm", "microvm_stub")
+    sandbox_backend_hint: Optional[str] = None
 
 
 class WorkerEventRecord(BaseModel):

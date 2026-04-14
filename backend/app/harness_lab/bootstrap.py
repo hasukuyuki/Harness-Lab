@@ -373,12 +373,19 @@ class HarnessLabServices:
             warnings.append(f"Workers are draining: {', '.join(execution['draining_workers'])}.")
         if execution["stuck_runs"]:
             warnings.append(f"Stuck run candidates detected: {len(execution['stuck_runs'])}.")
-        if not sandbox["docker_ready"]:
-            warnings.append("Docker sandbox backend is not ready.")
+        if not sandbox.get("executor_ready", False):
+            warnings.append(
+                f"Sandbox backend '{sandbox['sandbox_backend']}' is not ready: "
+                f"{sandbox.get('last_probe_error') or 'unknown readiness failure'}."
+            )
         elif not sandbox["sandbox_image_ready"]:
-            warnings.append(f"Sandbox image is missing: {sandbox['image']}.")
+            warnings.append(
+                f"Sandbox image/rootfs is missing for backend '{sandbox['sandbox_backend']}': {sandbox['image']}."
+            )
         elif not sandbox.get("hardened_ready", False):
-            warnings.append("Docker sandbox is available but hardened configuration is not fully ready.")
+            warnings.append(
+                f"Sandbox backend '{sandbox['sandbox_backend']}' is available but hardened execution is not fully ready."
+            )
         if not knowledge["ready"]:
             warnings.append("Knowledge index has not been built yet; retrieval will use live fallback search.")
         elif knowledge["fallback_mode"]:
@@ -422,8 +429,7 @@ class HarnessLabServices:
                 and artifacts["ready"]
                 and execution["postgres_ready"]
                 and execution["redis_ready"]
-                and sandbox["docker_ready"]
-                and sandbox["sandbox_image_ready"]
+                and sandbox.get("executor_ready", False)
             ),
         }
 

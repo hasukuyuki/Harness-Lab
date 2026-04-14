@@ -62,7 +62,11 @@ async def get_worker(worker_id: str):
         if not session.task_graph:
             continue
         for node in session.task_graph.nodes:
-            if node.status == "ready" and harness_lab_services.runtime._worker_matches_node(worker, session, node):
+            if node.status == "ready" and harness_lab_services.runtime.dispatch_constraint_calculator.worker_matches_node(
+                worker,
+                session,
+                node,
+            ):
                 eligible_task_count += 1
     return {
         "success": True,

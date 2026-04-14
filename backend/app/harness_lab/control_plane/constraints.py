@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 from ..bootstrap import harness_lab_services
-from ..types import ConstraintCreateRequest, ConstraintVerifyRequest
+from ..types import (
+    ConstraintCreateRequest,
+    ConstraintScenarioCreateRequest,
+    ConstraintValidateRequest,
+    ConstraintVerifyRequest,
+)
 
 router = APIRouter(prefix="/api/constraints", tags=["constraints"])
+
+
+class ConstraintReviseRequest(BaseModel):
+    """Request to revise a constraint document."""
+    title: Optional[str] = None
+    body: Optional[str] = None
 
 
 @router.get("")
@@ -33,6 +47,24 @@ async def create_constraint(request: ConstraintCreateRequest):
     return {
         "success": True,
         "data": document.model_dump(),
+    }
+
+
+@router.get("/scenarios")
+async def list_constraint_scenarios(root_document_id: Optional[str] = None):
+    scenarios = harness_lab_services.constraint_engine.list_scenarios(root_document_id=root_document_id)
+    return {
+        "success": True,
+        "data": [scenario.model_dump() for scenario in scenarios],
+    }
+
+
+@router.post("/scenarios")
+async def create_constraint_scenario(request: ConstraintScenarioCreateRequest):
+    scenario = harness_lab_services.constraint_engine.create_scenario(request)
+    return {
+        "success": True,
+        "data": scenario.model_dump(),
     }
 
 
@@ -111,6 +143,9 @@ async def verify_constraint(request: ConstraintVerifyRequest):
     return {
         "success": True,
         "data": {
+            "constraint_document_id": response.constraint_document_id,
+            "constraint_root_document_id": response.constraint_root_document_id,
+            "constraint_document_version": response.constraint_document_version,
             "verdicts": [verdict.model_dump() for verdict in response.verdicts],
             "final_verdict": response.final_verdict.model_dump(),
             "explanation": response.explanation.model_dump(),
@@ -166,5 +201,123 @@ async def explain_constraint(document_id: str):
             "document_id": document_id,
             "explanation": "\n".join(explanation_parts),
             "compilation_summary": summary,
+        },
+    }
+
+
+@router.post("/{document_id}/revise")
+async def revise_constraint(document_id: str, request: ConstraintReviseRequest):
+    """Create a revision of a constraint document.
+    
+    This creates a new candidate version with:
+    - Same root_document_id as the original
+    - parent_document_id pointing to the original
+    - version incremented
+    - status set to candidate
+    """
+    try:
+        document = harness_lab_services.constraint_engine.revise(
+            document_id=document_id,
+            title=request.title,
+            body=request.body,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    
+    return {
+        "success": True,
+        "data": document.model_dump(),
+    }
+
+
+@router.get("/{document_id}/versions")
+async def list_constraint_versions(document_id: str):
+    """List all versions in the constraint document chain.
+    
+    Returns documents ordered by version number, from oldest to newest.
+    """
+    try:
+        document = harness_lab_services.constraint_engine.get_document(document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    
+    versions = harness_lab_services.constraint_engine.list_versions(document.root_document_id)
+    
+    return {
+        "success": True,
+        "data": [doc.model_dump() for doc in versions],
+        "root_document_id": document.root_document_id,
+        "version_count": len(versions),
+    }
+
+
+@router.get("/{document_id}/diff")
+async def diff_constraint(document_id: str, against: str = Query(..., description="Document ID to compare against")):
+    """Compare two constraint documents.
+    
+    Returns diff information including:
+    - Body changes (added/removed lines)
+    - Compilation summary changes
+    - Metadata changes
+    """
+    try:
+        diff_result = harness_lab_services.constraint_engine.diff_documents(document_id, against)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    
+    return {
+        "success": True,
+        "data": diff_result,
+    }
+
+
+@router.post("/{document_id}/validate")
+async def validate_constraint(document_id: str, request: ConstraintValidateRequest):
+    try:
+        report = harness_lab_services.constraint_engine.validate_document(document_id, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return {
+        "success": True,
+        "data": report.model_dump(),
+    }
+
+
+@router.get("/{document_id}/gate")
+async def constraint_publish_gate(document_id: str):
+    try:
+        gate = harness_lab_services.constraint_engine.get_publish_gate(document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return {
+        "success": True,
+        "data": gate.model_dump(),
+    }
+
+
+@router.post("/{document_id}/publish-with-archive")
+async def publish_with_archive_constraint(document_id: str):
+    """Publish a constraint document and archive previous published versions.
+    
+    When publishing a new version in a chain, any previously published
+    version in the same chain will be automatically archived.
+    This is the recommended way to publish constraint revisions.
+    """
+    try:
+        document = harness_lab_services.constraint_engine.publish_with_archive(document_id)
+        gate = harness_lab_services.constraint_engine.get_publish_gate(document_id)
+    except ValueError as exc:
+        detail = str(exc)
+        if "publish blocked" in detail:
+            raise HTTPException(status_code=409, detail=detail) from exc
+        raise HTTPException(status_code=404, detail=detail) from exc
+    
+    return {
+        "success": True,
+        "data": {
+            "document": document.model_dump(),
+            "gate": gate.model_dump(),
         },
     }

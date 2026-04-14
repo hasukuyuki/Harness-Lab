@@ -3,6 +3,10 @@
 These adapters wrap RuntimeService to implement the protocols defined
 in protocols.py, enabling LeaseManager to depend on interfaces rather
 than concrete RuntimeService.
+
+Key refactoring: RuntimeConstraintAdapter now uses DispatchConstraintCalculator
+instead of RuntimeService private methods, removing fleet's dependency on
+runtime internals.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from .constraints import DispatchConstraintCalculator
 from .protocols import (
     DispatchConstraintProtocol,
     DispatchContextProtocol,
@@ -49,20 +54,45 @@ class RuntimeCoordinationAdapter(RunCoordinationProtocol):
         """Delegate to RunCoordinator."""
         return self.runtime.run_coordinator.mark_ready_nodes(session, run_id)
 
+    def record_handoffs(
+        self,
+        run: ResearchRun,
+        session: ResearchSession,
+        node: TaskNode,
+    ) -> List[Any]:
+        """Delegate to RuntimeService._record_handoffs_for_node.
+        
+        This enables fleet layer to trigger handoff recording without
+        depending on runtime internals directly.
+        """
+        return self.runtime._record_handoffs_for_node(run, session, node)
+
 
 class RuntimeConstraintAdapter(DispatchConstraintProtocol):
-    """Adapter for dispatch constraint operations."""
+    """Adapter for dispatch constraint operations.
+    
+    Uses DispatchConstraintCalculator (fleet layer) instead of RuntimeService
+    private methods, ensuring fleet layer is self-contained.
+    """
 
     def __init__(self, runtime: RuntimeService) -> None:
         self.runtime = runtime
+        self._calculator = getattr(
+            runtime,
+            "dispatch_constraint_calculator",
+            DispatchConstraintCalculator(
+                tool_gateway=runtime.tool_gateway,
+                worker_registry=runtime.worker_registry,
+            ),
+        )
 
     def constraint_for_node(
         self,
         node: TaskNode,
         session: ResearchSession,
     ) -> DispatchConstraint:
-        """Delegate to RuntimeService private method."""
-        return self.runtime._dispatch_constraint_for_node(session, node)
+        """Use DispatchConstraintCalculator (fleet layer)."""
+        return self._calculator.constraint_for_node(session, node)
 
     def worker_matches_node(
         self,
@@ -70,23 +100,35 @@ class RuntimeConstraintAdapter(DispatchConstraintProtocol):
         session: ResearchSession,
         node: TaskNode,
     ) -> bool:
-        """Delegate to RuntimeService private method."""
-        return self.runtime._worker_matches_node(worker, session, node)
+        """Use DispatchConstraintCalculator (fleet layer)."""
+        return self._calculator.worker_matches_node(worker, session, node)
 
     def list_dispatch_blockers(
         self,
         run: ResearchRun,
         session: ResearchSession,
     ) -> List[Dict[str, Any]]:
-        """Delegate to RuntimeService private method."""
-        return self.runtime._dispatch_blockers_for_run(run, session)
+        """Use DispatchConstraintCalculator (fleet layer)."""
+        return self._calculator.dispatch_blockers_for_run(run, session)
 
 
 class RuntimeDispatchContextAdapter(DispatchContextProtocol):
-    """Adapter for building dispatch context."""
+    """Adapter for building dispatch context.
+    
+    Uses DispatchConstraintCalculator for constraints, removing dependency
+    on RuntimeService private methods.
+    """
 
     def __init__(self, runtime: RuntimeService) -> None:
         self.runtime = runtime
+        self._calculator = getattr(
+            runtime,
+            "dispatch_constraint_calculator",
+            DispatchConstraintCalculator(
+                tool_gateway=runtime.tool_gateway,
+                worker_registry=runtime.worker_registry,
+            ),
+        )
 
     def build_dispatch(
         self,
@@ -132,8 +174,8 @@ class RuntimeDispatchContextAdapter(DispatchContextProtocol):
             None,
         )
         
-        # Get constraints
-        constraints = self.runtime._dispatch_constraint_for_node(session, node)
+        # Get constraints using fleet-layer calculator
+        constraints = self._calculator.constraint_for_node(session, node)
         
         # Get final verdict
         final_verdict = self.runtime._stored_final_verdict(run)

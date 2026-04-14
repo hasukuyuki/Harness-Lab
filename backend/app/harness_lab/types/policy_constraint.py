@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .base import (
     ConstraintStatus,
@@ -27,6 +27,8 @@ class MatchedRuleInfo(BaseModel):
     subject_pattern: str
     decision: VerdictDecision
     priority: int
+    source_document_id: Optional[str] = None
+    source_document_version: Optional[str] = None
     matched_conditions: List[str] = Field(default_factory=list)
     reason: str
 
@@ -55,6 +57,8 @@ class PolicyVerdict(BaseModel):
     created_at: str
     # Enhanced fields for semantic constraints
     rule_id: Optional[str] = None  # Stable rule identifier
+    source_document_id: Optional[str] = None
+    source_document_version: Optional[str] = None
     used_fallback: bool = False  # Whether this verdict used fallback logic
     explanation_summary: Optional[str] = None  # Human-readable summary
 
@@ -91,8 +95,21 @@ class ConstraintDocument(BaseModel):
     version: str = "v1"
     created_at: str
     updated_at: str
+    # Version chain fields for governance
+    root_document_id: Optional[str] = None  # Original document ID in the chain (self for new docs)
+    parent_document_id: Optional[str] = None  # Previous version if this is a revision
     # Extended payload field for compiled rules (stored in payload_json)
     compiled: Optional[ConstraintCompileSummary] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _hydrate_version_chain_defaults(cls, data: Any) -> Any:
+        """Backfill governance fields for bootstrap and legacy documents."""
+        if isinstance(data, dict):
+            document_id = data.get("document_id")
+            data.setdefault("root_document_id", document_id)
+            data.setdefault("parent_document_id", None)
+        return data
 
 
 class ContextProfile(BaseModel):
@@ -197,12 +214,91 @@ class ConstraintVerifyRequest(BaseModel):
 
 class ConstraintVerifyResponse(BaseModel):
     """Enhanced response for constraint verification."""
+    constraint_document_id: str
+    constraint_root_document_id: str
+    constraint_document_version: str
     verdicts: List[PolicyVerdict]
     final_verdict: PolicyVerdict
     explanation: ConstraintExplanation
     compiled_rule_count: int
     used_fallback: bool
     matched_rules: List[MatchedRuleInfo]
+
+
+class ConstraintScenario(BaseModel):
+    """Saved validation scenario for a constraint chain."""
+    scenario_id: str
+    root_document_id: str
+    name: str
+    subject: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    expected_decision: VerdictDecision
+    tags: List[str] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+
+
+class ConstraintScenarioCreateRequest(BaseModel):
+    """Request to create a validation scenario."""
+    root_document_id: str
+    name: str
+    subject: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    expected_decision: VerdictDecision
+    tags: List[str] = Field(default_factory=list)
+
+
+class ConstraintValidateRequest(BaseModel):
+    """Request to validate a candidate constraint document."""
+    scenario_ids: List[str] = Field(default_factory=list)
+
+
+class ConstraintScenarioResult(BaseModel):
+    """Validation result for a single saved scenario."""
+    scenario_id: str
+    name: str
+    expected_decision: VerdictDecision
+    actual_decision: VerdictDecision
+    passed: bool
+    hard_failure: bool = False
+    used_fallback: bool = False
+    matched_rule_ids: List[str] = Field(default_factory=list)
+    matched_document_ids: List[str] = Field(default_factory=list)
+    explanation: str
+
+
+class ConstraintValidationReport(BaseModel):
+    """Validation report for a constraint document candidate."""
+    report_id: str
+    document_id: str
+    root_document_id: str
+    document_version: str
+    status: str
+    compilation_status: str
+    compiled_rule_count: int
+    total_scenarios: int
+    passed_scenarios: int
+    failed_scenarios: int
+    hard_failure_count: int = 0
+    soft_deviation_count: int = 0
+    blockers: List[str] = Field(default_factory=list)
+    scenario_results: List[ConstraintScenarioResult] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+
+
+class ConstraintPublishGateStatus(BaseModel):
+    """Publish readiness for a constraint document candidate."""
+    document_id: str
+    root_document_id: str
+    document_version: str
+    publish_ready: bool
+    compilation_ok: bool
+    validation_ok: bool
+    scenario_count: int
+    hard_failure_count: int
+    blockers: List[str] = Field(default_factory=list)
+    latest_validation_report: Optional[ConstraintValidationReport] = None
 
 
 class PolicyCompareRequest(BaseModel):

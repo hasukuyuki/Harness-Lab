@@ -12,7 +12,8 @@ os.environ.setdefault("HARNESS_REDIS_URL", "redis://localhost:6379")
 from backend.app.harness_lab.constraints import ConstraintEngine
 from backend.app.harness_lab.types import (
     ConstraintCreateRequest,
-    ConstraintVerifyRequest,
+    ConstraintScenarioCreateRequest,
+    ConstraintValidateRequest,
 )
 from backend.app.harness_lab.storage import SqliteTestPlatformStore
 from backend.app.harness_lab.artifact_store import create_artifact_store
@@ -253,6 +254,77 @@ class TestConstraintEngineIntegration:
         candidates = constraint_engine.list_documents(status="candidate")
         # The published document should not be in candidates
         assert all(d.document_id != doc.document_id for d in candidates)
+
+    def test_constraint_scenarios_validation_and_publish_gate(self, constraint_engine):
+        doc = constraint_engine.create_document(ConstraintCreateRequest(
+            title="Scenario Policy",
+            body="Shell commands require approval. Destructive shell commands are denied.",
+            tags=["deny-destructive"],
+        ))
+
+        scenario = constraint_engine.create_scenario(ConstraintScenarioCreateRequest(
+            root_document_id=doc.root_document_id or doc.document_id,
+            name="Destructive shell should deny",
+            subject="tool.shell.execute",
+            payload={"command": "rm -rf /tmp/test"},
+            expected_decision="deny",
+            tags=["shell", "safety"],
+        ))
+
+        scenarios = constraint_engine.list_scenarios(doc.root_document_id)
+        assert any(item.scenario_id == scenario.scenario_id for item in scenarios)
+
+        report = constraint_engine.validate_document(
+            doc.document_id,
+            ConstraintValidateRequest(scenario_ids=[scenario.scenario_id]),
+        )
+        assert report.total_scenarios == 1
+        assert report.passed_scenarios == 1
+        assert report.failed_scenarios == 0
+
+        gate = constraint_engine.get_publish_gate(doc.document_id)
+        assert gate.publish_ready is True
+        assert gate.latest_validation_report is not None
+
+    def test_publish_with_archive_requires_validation_gate(self, constraint_engine):
+        doc = constraint_engine.create_document(ConstraintCreateRequest(
+            title="Gate Policy",
+            body="Filesystem writes require approval.",
+            tags=["filesystem"],
+        ))
+
+        gate = constraint_engine.get_publish_gate(doc.document_id)
+        assert gate.publish_ready is False
+        assert "validation" in " ".join(gate.blockers).lower()
+
+        with pytest.raises(ValueError, match="publish blocked"):
+            constraint_engine.publish_with_archive(doc.document_id)
+
+    def test_revision_publish_archives_previous_version(self, constraint_engine):
+        doc = constraint_engine.create_document(ConstraintCreateRequest(
+            title="Versioned Policy",
+            body="Shell commands require approval.",
+            tags=["shell"],
+        ))
+        scenario = constraint_engine.create_scenario(ConstraintScenarioCreateRequest(
+            root_document_id=doc.root_document_id or doc.document_id,
+            name="Shell commands require approval",
+            subject="tool.shell.execute",
+            payload={"command": "touch test.txt"},
+            expected_decision="approval_required",
+            tags=["shell"],
+        ))
+        constraint_engine.validate_document(doc.document_id, ConstraintValidateRequest(scenario_ids=[scenario.scenario_id]))
+        published_v1 = constraint_engine.publish_with_archive(doc.document_id)
+        assert published_v1.status == "published"
+
+        revised = constraint_engine.revise(published_v1.document_id, body="Shell commands require approval. Destructive shell commands are denied.")
+        constraint_engine.validate_document(revised.document_id, ConstraintValidateRequest(scenario_ids=[scenario.scenario_id]))
+        published_v2 = constraint_engine.publish_with_archive(revised.document_id)
+
+        archived_v1 = constraint_engine.get_document(published_v1.document_id)
+        assert archived_v1.status == "archived"
+        assert published_v2.status == "published"
 
 
 class TestConstraintEngineBackwardCompatibility:

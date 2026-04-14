@@ -37,7 +37,6 @@ from ..types import (
     RunRequest,
     SessionRequest,
     DispatchEnvelope,
-    DispatchConstraint,
     LeaseCompletionRequest,
     LeaseFailureRequest,
     LeaseReleaseRequest,
@@ -61,6 +60,7 @@ from ..fleet import create_protocol_adapters
 from ..fleet.lease_manager import LeaseManager
 from ..fleet.worker_registry import WorkerRegistry
 from ..fleet.dispatcher import Dispatcher, InMemoryDispatcher
+from ..fleet.constraints import DispatchConstraintCalculator
 
 
 class RuntimeService:
@@ -86,6 +86,10 @@ class RuntimeService:
         self.orchestrator = orchestrator
         self.prompt_assembler = prompt_assembler
         self.worker_registry = WorkerRegistry(database)
+        self.dispatch_constraint_calculator = DispatchConstraintCalculator(
+            tool_gateway=self.tool_gateway,
+            worker_registry=self.worker_registry,
+        )
         self.lease_timeout_seconds = 30
         self.reclaimed_lease_count = 0
         self.last_lease_sweep_at: Optional[str] = None
@@ -157,6 +161,8 @@ class RuntimeService:
             active_policy_id=refs["policy"].policy_id,
             workflow_template_id=refs["workflow_template"].workflow_id,
             constraint_set_id=refs["constraint"].document_id,
+            constraint_root_document_id=refs["constraint"].root_document_id or refs["constraint"].document_id,
+            constraint_version=refs["constraint"].version,
             context_profile_id=refs["context_profile"].context_profile_id,
             prompt_template_id=refs["prompt_template"].prompt_template_id,
             model_profile_id=refs["model_profile"].model_profile_id,
@@ -267,6 +273,8 @@ class RuntimeService:
         context_profile = self.get_context_profile(session.context_profile_id)
         prompt_template = self.get_prompt_template(session.prompt_template_id)
         constraint_document = self.constraint_engine.get_document(session.constraint_set_id)
+        session.constraint_root_document_id = session.constraint_root_document_id or constraint_document.root_document_id or constraint_document.document_id
+        session.constraint_version = session.constraint_version or constraint_document.version
         blocks, summary = self.context_manager.assemble(session, context_profile, session.intent_declaration)
         prompt_frame = self.prompt_assembler.render(
             session=session,
@@ -316,6 +324,9 @@ class RuntimeService:
             trace_id=new_id("trace"),
             session_id=session.session_id,
             prompt_frame_id=prompt_frame.prompt_frame_id,
+            constraint_document_id=constraint_document.document_id,
+            constraint_root_document_id=constraint_document.root_document_id or constraint_document.document_id,
+            constraint_version=constraint_document.version,
             intent_declaration=session.intent_declaration,
             model_calls=[session.intent_model_call] if session.intent_model_call else [],
             context_blocks=blocks,
@@ -334,6 +345,9 @@ class RuntimeService:
             mission_id=new_id("mission"),
             policy_id=session.active_policy_id,
             workflow_template_id=session.workflow_template_id,
+            constraint_set_id=session.constraint_set_id,
+            constraint_root_document_id=session.constraint_root_document_id,
+            constraint_version=session.constraint_version,
             prompt_frame=prompt_frame,
             execution_trace=trace,
             result={
@@ -387,8 +401,13 @@ class RuntimeService:
                 "decision": final_verdict.decision,
                 "matched_rule": final_verdict.matched_rule,
                 "rule_id": final_verdict.rule_id,
+                "source_document_id": final_verdict.source_document_id,
+                "source_document_version": final_verdict.source_document_version,
                 "used_fallback": preflight_result["used_fallback"],
                 "compiled_rule_count": preflight_result["compiled_rule_count"],
+                "constraint_set_id": session.constraint_set_id,
+                "constraint_root_document_id": session.constraint_root_document_id,
+                "constraint_version": session.constraint_version,
             },
             session_id=session.session_id,
             run_id=run_id,
@@ -405,6 +424,9 @@ class RuntimeService:
                 "decision": final_verdict.decision,
                 "used_fallback": preflight_result["used_fallback"],
                 "matched_rule_count": len(preflight_result["matched_rules"]),
+                "constraint_set_id": session.constraint_set_id,
+                "constraint_root_document_id": session.constraint_root_document_id,
+                "constraint_version": session.constraint_version,
             },
         )
         artifacts.append(constraint_snapshot)
@@ -753,6 +775,8 @@ class RuntimeService:
             active_policy_id=policy.policy_id,
             workflow_template_id=workflow.workflow_id,
             constraint_set_id=policy.constraint_set_id,
+            constraint_root_document_id=policy.constraint_set_id,
+            constraint_version=self.constraint_engine.get_document(policy.constraint_set_id).version,
             context_profile_id=profile_id or policy.context_profile_id,
             prompt_template_id=policy.prompt_template_id,
             model_profile_id=model_profile_id or policy.model_profile_id,
@@ -800,118 +824,6 @@ class RuntimeService:
 
     def _mark_ready_nodes(self, session: ResearchSession, run_id: str) -> bool:
         return self.run_coordinator.mark_ready_nodes(session, run_id)
-
-    def _worker_matches_node(self, worker, session: ResearchSession, node: TaskNode) -> bool:
-        if getattr(worker, "drain_state", "active") == "draining":
-            return False
-        constraints = self._dispatch_constraint_for_node(session, node)
-        if getattr(worker, "role_profile", None) and worker.role_profile != node.agent_role:
-            return False
-        if constraints.execution_mode and getattr(worker, "execution_mode", None) not in {constraints.execution_mode, "embedded"}:
-            return False
-        if constraints.requires_sandbox and not getattr(worker, "sandbox_ready", False):
-            return False
-        worker_labels = set(getattr(worker, "labels", []) or [])
-        if any(label not in worker_labels for label in constraints.required_labels):
-            return False
-        if constraints.required_capabilities and any(capability not in (worker.capabilities or []) for capability in constraints.required_capabilities):
-            return False
-        return True
-
-    def _dispatch_constraint_for_node(self, session: ResearchSession, node: TaskNode) -> DispatchConstraint:
-        metadata = node.metadata or {}
-        required_capabilities: List[str] = []
-        if node.kind == "execution":
-            required_capabilities = [session.intent_declaration.suggested_action.tool_name]
-        tool_name = required_capabilities[0] if required_capabilities else None
-        risk_level = self._tool_risk_level(tool_name) if tool_name else "low"
-        required_labels = [str(item) for item in metadata.get("required_labels", [])]
-        preferred_labels = [str(item) for item in metadata.get("preferred_labels", [])]
-        if tool_name == "knowledge_search":
-            preferred_labels = list(dict.fromkeys([*preferred_labels, "knowledge"]))
-        if node.agent_role == "executor" and risk_level in {"medium", "high"}:
-            preferred_labels = list(dict.fromkeys([*preferred_labels, "executor"]))
-        if node.agent_role == "researcher":
-            preferred_labels = list(dict.fromkeys([*preferred_labels, "research"]))
-        requires_sandbox = self.tool_gateway.requires_sandbox(session.intent_declaration.suggested_action) if node.kind == "execution" else False
-        queue_parts = [node.agent_role, risk_level]
-        queue_parts.extend(required_labels or ["unlabeled"])
-        return DispatchConstraint(
-            agent_role=node.agent_role,
-            required_capabilities=required_capabilities,
-            required_labels=required_labels,
-            preferred_labels=preferred_labels,
-            execution_mode="remote_http" if session.execution_mode == "remote_worker" else None,
-            requires_sandbox=requires_sandbox,
-            risk_level=risk_level,
-            queue_shard="/".join(queue_parts),
-        )
-
-    def _worker_sort_key(self, worker, session: ResearchSession, node: TaskNode) -> tuple[int, int, str]:
-        constraints = self._dispatch_constraint_for_node(session, node)
-        preferred_hits = sum(1 for label in constraints.preferred_labels if label in (worker.labels or []))
-        current_load = int(getattr(worker, "lease_count", 0) or 0)
-        return (-preferred_hits, current_load, worker.worker_id)
-
-    def _dispatch_blockers_for_run(self, run: ResearchRun, session: ResearchSession) -> List[Dict[str, Any]]:
-        task_graph = self._task_graph(session)
-        ready_nodes = [node for node in task_graph.nodes if node.status == "ready"]
-        if not ready_nodes:
-            return []
-        workers = self.worker_registry.list_workers()
-        blockers: List[Dict[str, Any]] = []
-        for node in ready_nodes:
-            constraints = self._dispatch_constraint_for_node(session, node)
-            role_workers = [worker for worker in workers if not worker.role_profile or worker.role_profile == node.agent_role]
-            matching_workers = [worker for worker in workers if self._worker_matches_node(worker, session, node)]
-            blocker = None
-            if not role_workers:
-                blocker = {
-                    "task_node_id": node.node_id,
-                    "kind": "no_role_worker",
-                    "agent_role": node.agent_role,
-                    "required_labels": constraints.required_labels,
-                    "required_capabilities": constraints.required_capabilities,
-                }
-            elif constraints.requires_sandbox and not any(worker.sandbox_ready for worker in role_workers):
-                blocker = {
-                    "task_node_id": node.node_id,
-                    "kind": "awaiting_sandbox_ready_worker",
-                    "agent_role": node.agent_role,
-                    "required_labels": constraints.required_labels,
-                    "required_capabilities": constraints.required_capabilities,
-                }
-            elif constraints.required_labels and not any(
-                all(label in (worker.labels or []) for label in constraints.required_labels)
-                for worker in role_workers
-            ):
-                blocker = {
-                    "task_node_id": node.node_id,
-                    "kind": "awaiting_required_label",
-                    "agent_role": node.agent_role,
-                    "required_labels": constraints.required_labels,
-                    "required_capabilities": constraints.required_capabilities,
-                }
-            elif role_workers and not matching_workers and all(worker.drain_state == "draining" for worker in role_workers):
-                blocker = {
-                    "task_node_id": node.node_id,
-                    "kind": "all_matching_workers_draining",
-                    "agent_role": node.agent_role,
-                    "required_labels": constraints.required_labels,
-                    "required_capabilities": constraints.required_capabilities,
-                }
-            elif role_workers and not matching_workers:
-                blocker = {
-                    "task_node_id": node.node_id,
-                    "kind": "no_matching_worker",
-                    "agent_role": node.agent_role,
-                    "required_labels": constraints.required_labels,
-                    "required_capabilities": constraints.required_capabilities,
-                }
-            if blocker:
-                blocker["queue_shard"] = constraints.queue_shard
-                blockers.append(blocker)
-        return blockers
 
     def _approval_token_for_run(self, run_id: str) -> Optional[str]:
         approvals = self.database.list_approvals(run_id=run_id)

@@ -177,7 +177,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sandbox = subparsers.add_parser("sandbox", help="Inspect local sandbox readiness")
     sandbox_subparsers = sandbox.add_subparsers(dest="sandbox_command", required=True)
-    sandbox_subparsers.add_parser("probe", help="Probe Docker sandbox readiness")
+    sandbox_subparsers.add_parser("probe", help="Probe sandbox backend readiness")
+    sandbox_subparsers.add_parser("backend", help="Show current sandbox backend and executor status")
+    sandbox_subparsers.add_parser("capabilities", help="Show executor capabilities for all backends")
 
     runs = subparsers.add_parser("runs", help="Inspect run execution state")
     run_subparsers = runs.add_subparsers(dest="runs_command", required=True)
@@ -476,7 +478,7 @@ def main() -> None:
                     capabilities=args.capability,
                     role_profile=args.role_profile or None,
                     sandbox_backend=sandbox_status.sandbox_backend,
-                    sandbox_ready=sandbox_status.docker_ready and sandbox_status.sandbox_image_ready,
+                    sandbox_ready=sandbox_status.executor_ready,
                     version="v1",
                 )
             )
@@ -485,9 +487,33 @@ def main() -> None:
         _emit([item.model_dump() for item in harness_lab_services.runtime.worker_registry.list_workers()], args.output_format)
         return
 
-    if args.command == "sandbox" and args.sandbox_command == "probe":
-        _emit(harness_lab_services.sandbox.status().model_dump(), args.output_format)
-        return
+    if args.command == "sandbox":
+        if args.sandbox_command == "probe":
+            _emit(harness_lab_services.sandbox.status().model_dump(), args.output_format)
+            return
+        if args.sandbox_command == "backend":
+            status = harness_lab_services.sandbox.status()
+            _emit(
+                {
+                    "active_backend": status.sandbox_backend,
+                    "executor_ready": status.executor_ready,
+                    "executor_version": status.executor_version,
+                    "executor_capabilities": status.executor_capabilities,
+                    "fallback_mode": status.fallback_mode,
+                    "docker_ready": status.docker_ready,
+                    "sandbox_image_ready": status.sandbox_image_ready,
+                    "hardened_ready": status.hardened_ready,
+                    "last_probe_error": status.last_probe_error,
+                },
+                args.output_format,
+            )
+            return
+        if args.sandbox_command == "capabilities":
+            registry_status = harness_lab_services.sandbox.registry.get_status(
+                harness_lab_services.sandbox.get_configured_backend()
+            )
+            _emit(registry_status, args.output_format)
+            return
 
     if args.command == "worker":
         if args.worker_command == "register":
@@ -510,10 +536,7 @@ def main() -> None:
                     capabilities=args.capability,
                     role_profile=args.role_profile or None,
                     sandbox_backend=harness_lab_services.sandbox.status().sandbox_backend,
-                    sandbox_ready=(
-                        harness_lab_services.sandbox.status().docker_ready
-                        and harness_lab_services.sandbox.status().sandbox_image_ready
-                    ),
+                    sandbox_ready=harness_lab_services.sandbox.status().executor_ready,
                     version="v1",
                 )
             )

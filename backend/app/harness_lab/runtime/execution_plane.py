@@ -48,7 +48,7 @@ class RunCoordinator:
             mission_status=mission.status if mission else None,
             counts_by_status=dict(sorted(counts.items())),
             node_ids_by_status=node_ids_by_status,
-            dispatch_blockers=self.runtime._dispatch_blockers_for_run(run, session),
+            dispatch_blockers=self.runtime.dispatch_constraint_calculator.dispatch_blockers_for_run(run, session),
             active_lease_id=run.active_lease_id,
             current_attempt_id=run.current_attempt_id,
             updated_at=utc_now(),
@@ -166,7 +166,7 @@ class RunCoordinator:
             node.status = "ready"
             node.metadata["ready_at"] = utc_now()
             changed = True
-            constraints = self.runtime._dispatch_constraint_for_node(session, node)
+            constraints = self.runtime.dispatch_constraint_calculator.constraint_for_node(session, node)
             self.runtime.dispatch_queue.enqueue_ready_task(run_id, node.node_id, shard=constraints.queue_shard)
             self.runtime.database.append_event(
                 "task.ready",

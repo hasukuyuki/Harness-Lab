@@ -60,6 +60,28 @@ POSTGRES_SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS constraint_scenarios (
+        scenario_id TEXT PRIMARY KEY,
+        root_document_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        expected_decision TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS constraint_validation_reports (
+        report_id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        root_document_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS context_profiles (
         context_profile_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -308,6 +330,26 @@ CREATE TABLE IF NOT EXISTS constraints_documents (
     scope TEXT NOT NULL,
     status TEXT NOT NULL,
     version TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS constraint_scenarios (
+    scenario_id TEXT PRIMARY KEY,
+    root_document_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    expected_decision TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS constraint_validation_reports (
+    report_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    root_document_id TEXT NOT NULL,
+    status TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -1028,6 +1070,8 @@ class PostgresPlatformStore(BaseSqlPlatformStore):
             "ALTER TABLE runs ADD COLUMN IF NOT EXISTS current_attempt_id TEXT",
             "ALTER TABLE runs ADD COLUMN IF NOT EXISTS active_lease_id TEXT",
             "ALTER TABLE worker_leases ADD COLUMN IF NOT EXISTS approval_token TEXT",
+            "ALTER TABLE constraints_documents ADD COLUMN IF NOT EXISTS root_document_id TEXT",
+            "ALTER TABLE constraints_documents ADD COLUMN IF NOT EXISTS parent_document_id TEXT",
         ]
         for statement in statements:
             self.execute(statement)
@@ -1115,6 +1159,8 @@ class SqliteTestPlatformStore(BaseSqlPlatformStore):
         self._ensure_column("runs", "current_attempt_id", "TEXT")
         self._ensure_column("runs", "active_lease_id", "TEXT")
         self._ensure_column("worker_leases", "approval_token", "TEXT")
+        self._ensure_column("constraints_documents", "root_document_id", "TEXT")
+        self._ensure_column("constraints_documents", "parent_document_id", "TEXT")
 
     def _ensure_column(self, table: str, column: str, column_type: str) -> None:
         with self.connection() as conn:

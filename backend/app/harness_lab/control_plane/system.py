@@ -64,8 +64,7 @@ async def health():
                 if execution["postgres_ready"]
                 and execution["redis_ready"]
                 and artifacts["ready"]
-                and execution["docker_ready"]
-                and execution["sandbox_image_ready"]
+                and execution.get("sandbox_executor_ready", False)
                 else "degraded"
             ),
             "mode": "multi_agent_platform",
@@ -120,6 +119,12 @@ async def health():
             "sandbox_hardened_ready": execution.get("sandbox_hardened_ready", False),
             "sandbox_rootless_ready": execution.get("sandbox_rootless_ready", False),
             "sandbox_policy_enforcement_ready": execution.get("sandbox_policy_enforcement_ready", False),
+            # Executor abstraction fields
+            "sandbox_executor_ready": execution.get("sandbox_executor_ready", False),
+            "sandbox_executor_capabilities": execution.get("sandbox_executor_capabilities", {}),
+            "sandbox_executor_version": execution.get("sandbox_executor_version"),
+            "sandbox_backend_fallback_mode": execution.get("sandbox_backend_fallback_mode", False),
+            "sandbox_all_backends": execution.get("sandbox_all_backends", {}),
             "constraint_engine_version": constraint_status.constraint_engine_version,
             "constraint_parser_ready": constraint_status.constraint_parser_ready,
             "constraint_compiler_ready": constraint_status.constraint_compiler_ready,

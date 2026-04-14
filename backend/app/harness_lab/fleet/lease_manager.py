@@ -210,12 +210,14 @@ class LeaseManager:
                 "completed",
                 {"completed_at": utc_now(), "summary": request.summary or node.label, "worker_lease_id": lease.lease_id},
             )
-            # TODO: handoff recording
+            # Record handoff packets for the completed execution node
+            self.coordination.record_handoffs(run, session, node)
         else:
             outcome = self.execution.execute_control_plane_node(node, run, session)
             if inspect.isawaitable(outcome):
                 outcome = await outcome
-            # TODO: handle outcome
+            # Control plane nodes also need handoff recording
+            self.coordination.record_handoffs(run, session, node)
         
         # Update attempt
         attempt = self.database.get_attempt(lease.attempt_id)
@@ -431,6 +433,12 @@ class LeaseManager:
         active_workers = [worker.worker_id for worker in workers if worker.state in {"leased", "executing"}]
         sandbox = runtime.sandbox_status() if runtime is not None else None
         sandbox_failures = len([event for event in self.database.list_events(limit=1_000) if event.event_type == "sandbox.failed"])
+        
+        # Build executor-related status fields
+        executor_status = {}
+        if sandbox and hasattr(sandbox, 'executor_status'):
+            executor_status = sandbox.executor_status or {}
+        
         return {
             "storage_backend": self.database.backend_name,
             "postgres_ready": postgres_ready,
@@ -452,6 +460,7 @@ class LeaseManager:
             "unhealthy_workers": unhealthy_workers,
             "active_workers": active_workers,
             "stuck_runs": [item.model_dump() for item in stuck_runs],
+            # Legacy fields (for backward compatibility)
             "sandbox_backend": sandbox.sandbox_backend if sandbox else None,
             "docker_ready": sandbox.docker_ready if sandbox else False,
             "sandbox_image_ready": sandbox.sandbox_image_ready if sandbox else False,
@@ -459,6 +468,15 @@ class LeaseManager:
             "sandbox_failures": sandbox_failures,
             "sandbox_fallback_mode": sandbox.fallback_mode if sandbox else True,
             "sandbox_last_probe_error": sandbox.last_probe_error if sandbox else "Sandbox manager is not configured.",
+            "sandbox_hardened_ready": getattr(sandbox, 'hardened_ready', False) if sandbox else False,
+            "sandbox_rootless_ready": getattr(sandbox, 'rootless_ready', False) if sandbox else False,
+            "sandbox_policy_enforcement_ready": getattr(sandbox, 'policy_enforcement_ready', False) if sandbox else False,
+            # New executor abstraction fields
+            "sandbox_executor_ready": executor_status.get('ready', False) if executor_status else (sandbox.executor_ready if sandbox else False),
+            "sandbox_executor_capabilities": executor_status.get('capabilities', {}) if executor_status else (getattr(sandbox, 'executor_capabilities', {}) if sandbox else {}),
+            "sandbox_executor_version": executor_status.get('version') if executor_status else getattr(sandbox, 'executor_version', None),
+            "sandbox_backend_fallback_mode": executor_status.get('fallback_mode', True) if executor_status else (sandbox.fallback_mode if sandbox else True),
+            "sandbox_all_backends": executor_status.get('all_backends', {}) if executor_status else {},
         }
 
     def fleet_status(self) -> FleetStatusReport:

@@ -120,6 +120,8 @@ class ConstraintVerifier:
                     matched_rule=rule.subject_pattern,
                     created_at=utc_now(),
                     rule_id=rule.rule_id,
+                    source_document_id=rule.source_document_id,
+                    source_document_version=compiled_set.document_version,
                     used_fallback=compiled_set.used_fallback,
                     explanation_summary=f"Rule '{rule.rule_id}' matched with decision '{rule.decision}'",
                 )
@@ -130,6 +132,8 @@ class ConstraintVerifier:
                     subject_pattern=rule.subject_pattern,
                     decision=rule.decision,
                     priority=rule.priority,
+                    source_document_id=rule.source_document_id,
+                    source_document_version=compiled_set.document_version,
                     matched_conditions=matched_conditions,
                     reason=reason,
                 ))
@@ -336,6 +340,8 @@ class ConstraintVerifier:
                 rule_id=None,
                 used_fallback=True,
                 explanation_summary="No explicit rules matched, using fallback",
+                source_document_id=compiled_set.document_id,
+                source_document_version=compiled_set.document_version,
             ))
             
             if ctx.action == "read":
@@ -349,6 +355,8 @@ class ConstraintVerifier:
                     rule_id=None,
                     used_fallback=True,
                     explanation_summary="Heuristic classification: read-only command",
+                    source_document_id=compiled_set.document_id,
+                    source_document_version=compiled_set.document_version,
                 ))
             elif ctx.action == "mutate":
                 verdicts.append(PolicyVerdict(
@@ -361,6 +369,8 @@ class ConstraintVerifier:
                     rule_id=None,
                     used_fallback=True,
                     explanation_summary="Heuristic classification: mutating command",
+                    source_document_id=compiled_set.document_id,
+                    source_document_version=compiled_set.document_version,
                 ))
             elif ctx.action == "destructive":
                 verdicts.append(PolicyVerdict(
@@ -373,6 +383,8 @@ class ConstraintVerifier:
                     rule_id=None,
                     used_fallback=True,
                     explanation_summary="Heuristic classification: destructive command",
+                    source_document_id=compiled_set.document_id,
+                    source_document_version=compiled_set.document_version,
                 ))
         
         elif ctx.tool_name == "filesystem":
@@ -387,6 +399,8 @@ class ConstraintVerifier:
                     rule_id=None,
                     used_fallback=True,
                     explanation_summary="Fallback: read-only filesystem access",
+                    source_document_id=compiled_set.document_id,
+                    source_document_version=compiled_set.document_version,
                 ))
             elif ctx.action == "write":
                 verdicts.append(PolicyVerdict(
@@ -399,6 +413,8 @@ class ConstraintVerifier:
                     rule_id=None,
                     used_fallback=True,
                     explanation_summary="Fallback: filesystem write requires approval",
+                    source_document_id=compiled_set.document_id,
+                    source_document_version=compiled_set.document_version,
                 ))
         
         elif ctx.tool_name == "git":
@@ -413,6 +429,8 @@ class ConstraintVerifier:
                     rule_id=None,
                     used_fallback=True,
                     explanation_summary="Fallback: read-only git operation",
+                    source_document_id=compiled_set.document_id,
+                    source_document_version=compiled_set.document_version,
                 ))
             else:
                 verdicts.append(PolicyVerdict(
@@ -425,6 +443,8 @@ class ConstraintVerifier:
                     rule_id=None,
                     used_fallback=True,
                     explanation_summary="Fallback: mutable git operation requires approval",
+                    source_document_id=compiled_set.document_id,
+                    source_document_version=compiled_set.document_version,
                 ))
         
         elif ctx.tool_name == "http_fetch":
@@ -438,6 +458,8 @@ class ConstraintVerifier:
                 rule_id=None,
                 used_fallback=True,
                 explanation_summary="Fallback: HTTP GET allowed by default",
+                source_document_id=compiled_set.document_id,
+                source_document_version=compiled_set.document_version,
             ))
         
         elif ctx.tool_name == "knowledge_search":
@@ -451,6 +473,8 @@ class ConstraintVerifier:
                 rule_id=None,
                 used_fallback=True,
                 explanation_summary="Fallback: knowledge search allowed",
+                source_document_id=compiled_set.document_id,
+                source_document_version=compiled_set.document_version,
             ))
         
         elif ctx.tool_name == "model_reflection":
@@ -464,6 +488,8 @@ class ConstraintVerifier:
                 rule_id=None,
                 used_fallback=True,
                 explanation_summary="Fallback: model reflection allowed",
+                source_document_id=compiled_set.document_id,
+                source_document_version=compiled_set.document_version,
             ))
         
         elif ctx.tool_name == "mcp_proxy":
@@ -477,6 +503,8 @@ class ConstraintVerifier:
                 rule_id=None,
                 used_fallback=True,
                 explanation_summary="Fallback: external proxy requires approval",
+                source_document_id=compiled_set.document_id,
+                source_document_version=compiled_set.document_version,
             ))
         
         else:
@@ -491,6 +519,8 @@ class ConstraintVerifier:
                 rule_id=None,
                 used_fallback=True,
                 explanation_summary="Fallback: unknown tool denied by default",
+                source_document_id=compiled_set.document_id,
+                source_document_version=compiled_set.document_version,
             ))
         
         # Build explanation
@@ -500,6 +530,8 @@ class ConstraintVerifier:
                 subject_pattern=v.matched_rule,
                 decision=v.decision,
                 priority=50,
+                source_document_id=v.source_document_id,
+                source_document_version=v.source_document_version,
                 matched_conditions=[],
                 reason=v.reason,
             )
@@ -561,6 +593,8 @@ class ConstraintVerifier:
                 matched_rule="default.deny",
                 created_at=utc_now(),
                 rule_id=None,
+                source_document_id=None,
+                source_document_version=None,
                 used_fallback=explanation.used_fallback,
                 explanation_summary="Default deny - no matching rules",
             )
@@ -578,6 +612,8 @@ class ConstraintVerifier:
             matched_rule=final.matched_rule,
             created_at=utc_now(),
             rule_id=final.rule_id,
+            source_document_id=final.source_document_id,
+            source_document_version=final.source_document_version,
             used_fallback=explanation.used_fallback,
             explanation_summary=explanation.final_reason,
         )

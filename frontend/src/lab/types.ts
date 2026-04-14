@@ -38,6 +38,8 @@ export interface ResearchSession {
   active_policy_id: string
   workflow_template_id?: string | null
   constraint_set_id: string
+  constraint_root_document_id?: string | null
+  constraint_version?: string | null
   context_profile_id: string
   prompt_template_id: string
   model_profile_id: string
@@ -155,6 +157,9 @@ export interface ExecutionTrace {
   trace_id: string
   session_id: string
   prompt_frame_id: string
+  constraint_document_id?: string | null
+  constraint_root_document_id?: string | null
+  constraint_version?: string | null
   intent_declaration: IntentDeclaration
   model_calls: ModelCallTrace[]
   context_blocks: ContextBlock[]
@@ -174,6 +179,9 @@ export interface ResearchRun {
   mission_id?: string | null
   policy_id?: string | null
   workflow_template_id?: string | null
+  constraint_set_id?: string | null
+  constraint_root_document_id?: string | null
+  constraint_version?: string | null
   assigned_worker_id?: string | null
   current_attempt_id?: string | null
   active_lease_id?: string | null
@@ -258,18 +266,36 @@ export interface ReplayEnvelope {
   leases?: WorkerLease[]
 }
 
+export interface ConstraintCompileSummary {
+  status: string // success, partial, failed, not_compiled
+  compiled_at?: string | null
+  rule_count: number
+  errors: string[]
+  used_fallback: boolean
+}
+
+export type ConstraintStatus = "candidate" | "published" | "archived"
+
 export interface ConstraintDocument {
   document_id: string
   title: string
   body: string
   scope: string
-  status: string
+  status: ConstraintStatus
   tags: string[]
   priority: number
   source: string
   version: string
   created_at: string
   updated_at: string
+  root_document_id: string // Original document ID in the chain (self for new docs)
+  parent_document_id?: string | null // Previous version if this is a revision
+  compiled?: ConstraintCompileSummary | null
+}
+
+export interface ConstraintDetailResponse {
+  document: ConstraintDocument
+  compilation_summary: ConstraintCompileSummary
 }
 
 export interface HarnessPolicy {
@@ -517,4 +543,181 @@ export interface CandidateCreationResponse {
   diagnosis?: Record<string, unknown>
   evaluations?: EvaluationReport[]
   gate?: PublishGateStatus
+}
+
+// Constraint Verification Types
+export interface MatchedRuleInfo {
+  rule_id: string
+  subject_pattern: string
+  decision: string // allow, deny, approval_required
+  priority: number
+  source_document_id?: string | null
+  source_document_version?: string | null
+  matched_conditions: string[]
+  reason: string
+}
+
+export interface ConstraintExplanation {
+  document_id: string
+  explanation: string
+  compilation_summary: ConstraintCompileSummary
+}
+
+export interface ConstraintEvaluationExplanation {
+  subject: string
+  final_decision: string // allow, deny, approval_required
+  final_reason: string
+  matched_rules: MatchedRuleInfo[]
+  evaluated_rules: number
+  used_fallback: boolean
+  fallback_reason?: string | null
+  compilation_status: string // success, partial, failed, not_compiled
+  compiled_rule_count: number
+  context_snapshot: Record<string, unknown>
+}
+
+export interface EnhancedPolicyVerdict {
+  verdict_id: string
+  subject: string
+  decision: string // allow, deny, approval_required
+  reason: string
+  matched_rule: string
+  created_at: string
+  rule_id?: string | null
+  source_document_id?: string | null
+  source_document_version?: string | null
+  used_fallback: boolean
+  explanation_summary?: string | null
+}
+
+export interface ConstraintVerifyRequest {
+  subject: string
+  payload: Record<string, unknown>
+  constraint_set_id?: string | null
+}
+
+export interface ConstraintVerifyResponse {
+  constraint_document_id: string
+  constraint_root_document_id: string
+  constraint_document_version: string
+  verdicts: EnhancedPolicyVerdict[]
+  final_verdict: EnhancedPolicyVerdict
+  explanation: ConstraintEvaluationExplanation
+  compiled_rule_count: number
+  used_fallback: boolean
+  matched_rules: MatchedRuleInfo[]
+}
+
+export interface ConstraintScenario {
+  scenario_id: string
+  root_document_id: string
+  name: string
+  subject: string
+  payload: Record<string, unknown>
+  expected_decision: string
+  tags: string[]
+  created_at: string
+  updated_at: string
+}
+
+export interface ConstraintScenarioCreateRequest {
+  root_document_id: string
+  name: string
+  subject: string
+  payload: Record<string, unknown>
+  expected_decision: 'allow' | 'approval_required' | 'deny'
+  tags?: string[]
+}
+
+export interface ConstraintScenarioResult {
+  scenario_id: string
+  name: string
+  expected_decision: string
+  actual_decision: string
+  passed: boolean
+  hard_failure: boolean
+  used_fallback: boolean
+  matched_rule_ids: string[]
+  matched_document_ids: string[]
+  explanation: string
+}
+
+export interface ConstraintValidationReport {
+  report_id: string
+  document_id: string
+  root_document_id: string
+  document_version: string
+  status: string
+  compilation_status: string
+  compiled_rule_count: number
+  total_scenarios: number
+  passed_scenarios: number
+  failed_scenarios: number
+  hard_failure_count: number
+  soft_deviation_count: number
+  blockers: string[]
+  scenario_results: ConstraintScenarioResult[]
+  created_at: string
+  updated_at: string
+}
+
+export interface ConstraintPublishGateStatus {
+  document_id: string
+  root_document_id: string
+  document_version: string
+  publish_ready: boolean
+  compilation_ok: boolean
+  validation_ok: boolean
+  scenario_count: number
+  hard_failure_count: number
+  blockers: string[]
+  latest_validation_report?: ConstraintValidationReport | null
+}
+
+export interface ConstraintEngineStatus {
+  constraint_engine_version: string
+  constraint_parser_ready: boolean
+  constraint_compiler_ready: boolean
+  constraint_fallback_mode: boolean
+  published_constraint_count: number
+  total_constraint_count: number
+}
+
+export interface ConstraintVersionListResponse {
+  data: ConstraintDocument[]
+  root_document_id: string
+  version_count: number
+}
+
+export interface ConstraintDiffResponse {
+  base_document_id: string
+  target_document_id: string
+  base_version: string
+  target_version: string
+  body_diff: {
+    added_lines: string[]
+    removed_lines: string[]
+    unchanged_lines: number
+  }
+  compilation_diff: {
+    rule_count_change: number
+    status_change: {
+      from: string
+      to: string
+    }
+    errors_change: {
+      from: string[]
+      to: string[]
+    }
+    fallback_change: {
+      from: boolean
+      to: boolean
+    }
+  }
+  metadata_diff: {
+    title_change: boolean
+    priority_change: boolean
+    tags_added: string[]
+    tags_removed: string[]
+  }
 }

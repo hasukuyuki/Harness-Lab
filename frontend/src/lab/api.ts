@@ -2,6 +2,16 @@ import type {
   CandidateCreationResponse,
   ConstraintCreateRequest,
   ConstraintDocument,
+  ConstraintDetailResponse,
+  ConstraintDiffResponse,
+  ConstraintExplanation,
+  ConstraintPublishGateStatus,
+  ConstraintScenario,
+  ConstraintScenarioCreateRequest,
+  ConstraintValidationReport,
+  ConstraintVersionListResponse,
+  ConstraintVerifyRequest,
+  ConstraintVerifyResponse,
   ContextAssembly,
   EvaluationReport,
   ExperimentRun,
@@ -92,6 +102,46 @@ export const api = {
     }),
   publishConstraint: async (documentId: string) =>
     request<ConstraintDocument>(`/api/constraints/${documentId}/publish`, {
+      method: 'POST',
+    }),
+  getConstraint: async (documentId: string) =>
+    request<ConstraintDetailResponse>(`/api/constraints/${documentId}`),
+  archiveConstraint: async (documentId: string) =>
+    request<ConstraintDocument>(`/api/constraints/${documentId}/archive`, {
+      method: 'POST',
+    }),
+  verifyConstraint: async (payload: ConstraintVerifyRequest) =>
+    request<ConstraintVerifyResponse>('/api/constraints/verify', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  getConstraintExplanation: async (documentId: string) =>
+    request<ConstraintExplanation>(`/api/constraints/${documentId}/explanation`),
+  createConstraintScenario: async (payload: ConstraintScenarioCreateRequest) =>
+    request<ConstraintScenario>('/api/constraints/scenarios', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  listConstraintScenarios: async (rootDocumentId?: string) =>
+    request<ConstraintScenario[]>(`/api/constraints/scenarios${rootDocumentId ? `?root_document_id=${encodeURIComponent(rootDocumentId)}` : ''}`),
+  validateConstraint: async (documentId: string, payload: { scenario_ids?: string[] } = {}) =>
+    request<ConstraintValidationReport>(`/api/constraints/${documentId}/validate`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  getConstraintGate: async (documentId: string) =>
+    request<ConstraintPublishGateStatus>(`/api/constraints/${documentId}/gate`),
+  reviseConstraint: async (documentId: string, payload: { title?: string; body?: string }) =>
+    request<ConstraintDocument>(`/api/constraints/${documentId}/revise`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  listConstraintVersions: async (documentId: string) =>
+    request<ConstraintVersionListResponse>(`/api/constraints/${documentId}/versions`),
+  diffConstraints: async (documentId: string, againstDocumentId: string) =>
+    request<ConstraintDiffResponse>(`/api/constraints/${documentId}/diff?against=${encodeURIComponent(againstDocumentId)}`),
+  publishConstraintWithArchive: async (documentId: string) =>
+    request<{ document: ConstraintDocument; gate: ConstraintPublishGateStatus }>(`/api/constraints/${documentId}/publish-with-archive`, {
       method: 'POST',
     }),
   listRuns: async () => request<ResearchRun[]>('/api/runs'),

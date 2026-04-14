@@ -26,6 +26,12 @@ class HarnessLabSettings(BaseModel):
     sandbox_image: str = Field("harness-lab/sandbox:local", alias="HARNESS_SANDBOX_IMAGE")
     sandbox_timeout_seconds: int = Field(20, alias="HARNESS_SANDBOX_TIMEOUT_SECONDS")
     docker_bin: str = Field("docker", alias="HARNESS_DOCKER_BIN")
+    microvm_binary: str = Field("python3", alias="HARNESS_MICROVM_BINARY")
+    microvm_kernel_image: str | None = Field(None, alias="HARNESS_MICROVM_KERNEL_IMAGE")
+    microvm_rootfs_image: str | None = Field(None, alias="HARNESS_MICROVM_ROOTFS_IMAGE")
+    microvm_workdir: str | None = Field(None, alias="HARNESS_MICROVM_WORKDIR")
+    microvm_timeout_seconds: int = Field(20, alias="HARNESS_MICROVM_TIMEOUT_SECONDS")
+    microvm_enable_snapshots: bool = Field(False, alias="HARNESS_MICROVM_ENABLE_SNAPSHOTS")
     # Hardened sandbox settings
     sandbox_rootless_user: str = Field("1000:1000", alias="HARNESS_SANDBOX_ROOTLESS_USER")
     sandbox_no_new_privileges: bool = Field(True, alias="HARNESS_SANDBOX_NO_NEW_PRIVILEGES")
@@ -55,6 +61,12 @@ class HarnessLabSettings(BaseModel):
             "HARNESS_SANDBOX_IMAGE": os.getenv("HARNESS_SANDBOX_IMAGE", "harness-lab/sandbox:local"),
             "HARNESS_SANDBOX_TIMEOUT_SECONDS": os.getenv("HARNESS_SANDBOX_TIMEOUT_SECONDS", "20"),
             "HARNESS_DOCKER_BIN": os.getenv("HARNESS_DOCKER_BIN", "docker"),
+            "HARNESS_MICROVM_BINARY": os.getenv("HARNESS_MICROVM_BINARY", "python3"),
+            "HARNESS_MICROVM_KERNEL_IMAGE": os.getenv("HARNESS_MICROVM_KERNEL_IMAGE"),
+            "HARNESS_MICROVM_ROOTFS_IMAGE": os.getenv("HARNESS_MICROVM_ROOTFS_IMAGE"),
+            "HARNESS_MICROVM_WORKDIR": os.getenv("HARNESS_MICROVM_WORKDIR"),
+            "HARNESS_MICROVM_TIMEOUT_SECONDS": os.getenv("HARNESS_MICROVM_TIMEOUT_SECONDS", "20"),
+            "HARNESS_MICROVM_ENABLE_SNAPSHOTS": os.getenv("HARNESS_MICROVM_ENABLE_SNAPSHOTS", "false"),
             "HARNESS_SANDBOX_ROOTLESS_USER": os.getenv("HARNESS_SANDBOX_ROOTLESS_USER", "1000:1000"),
             "HARNESS_SANDBOX_NO_NEW_PRIVILEGES": os.getenv("HARNESS_SANDBOX_NO_NEW_PRIVILEGES", "true"),
             "HARNESS_SANDBOX_CAP_DROP_ALL": os.getenv("HARNESS_SANDBOX_CAP_DROP_ALL", "true"),
@@ -73,6 +85,8 @@ class HarnessLabSettings(BaseModel):
             raise RuntimeError("HARNESS_REDIS_URL is required.")
         if self.artifact_backend not in {"local", "s3"}:
             raise RuntimeError("HARNESS_ARTIFACT_BACKEND must be either 'local' or 's3'.")
+        if self.sandbox_backend not in {"docker", "microvm", "microvm_stub"}:
+            raise RuntimeError("HARNESS_SANDBOX_BACKEND must be one of 'docker', 'microvm', or 'microvm_stub'.")
 
     def resolved_artifact_root(self) -> str | None:
         if self.artifact_root:

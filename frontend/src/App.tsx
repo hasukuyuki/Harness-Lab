@@ -35,6 +35,12 @@ import { StatusPill } from './lab/components/StatusPill'
 import type {
   ApprovalRequest,
   ConstraintDocument,
+  ConstraintDetailResponse,
+  ConstraintDiffResponse,
+  ConstraintPublishGateStatus,
+  ConstraintScenario,
+  ConstraintValidationReport,
+  ConstraintVerifyResponse,
   ContextAssembly,
   EvaluationReport,
   EventEnvelope,
@@ -55,6 +61,7 @@ import type {
   RunDetail,
   WorkerSnapshot,
   WorkflowTemplateVersion,
+  ConstraintEngineStatus,
 } from './lab/types'
 
 const { Header, Content } = Layout
@@ -93,10 +100,25 @@ function App() {
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
   const [constraints, setConstraints] = useState<ConstraintDocument[]>([])
+  const [selectedConstraintId, setSelectedConstraintId] = useState<string | null>(null)
+  const [constraintDetail, setConstraintDetail] = useState<ConstraintDetailResponse | null>(null)
+  const [constraintVersions, setConstraintVersions] = useState<ConstraintDocument[]>([])
+  const [constraintCompareId, setConstraintCompareId] = useState<string | null>(null)
+  const [constraintDiff, setConstraintDiff] = useState<ConstraintDiffResponse | null>(null)
+  const [constraintScenarios, setConstraintScenarios] = useState<ConstraintScenario[]>([])
+  const [selectedScenarioIds, setSelectedScenarioIds] = useState<string[]>([])
+  const [scenarioName, setScenarioName] = useState('Destructive shell command should be denied')
+  const [scenarioTags, setScenarioTags] = useState('safety,shell')
+  const [constraintValidationReport, setConstraintValidationReport] = useState<ConstraintValidationReport | null>(null)
+  const [constraintPublishGate, setConstraintPublishGate] = useState<ConstraintPublishGateStatus | null>(null)
   const [newConstraintTitle, setNewConstraintTitle] = useState('Exploratory network policy')
   const [newConstraintBody, setNewConstraintBody] = useState(
     'Allow HTTP GET for research, require review for mutable shell commands, and deny destructive shell patterns.'
   )
+  const [verifySubject, setVerifySubject] = useState('shell.exec')
+  const [verifyPayloadJson, setVerifyPayloadJson] = useState('{\n  "tool_name": "shell_exec",\n  "action": "run",\n  "command": "rm -rf /tmp/test"\n}')
+  const [verifyConstraintSetId, setVerifyConstraintSetId] = useState<string | null>(null)
+  const [verifyResponse, setVerifyResponse] = useState<ConstraintVerifyResponse | null>(null)
   const [contextPreview, setContextPreview] = useState<ContextAssembly | null>(null)
   const [promptFrame, setPromptFrame] = useState<PromptFrame | null>(null)
   const [runs, setRuns] = useState<ResearchRun[]>([])
@@ -313,7 +335,7 @@ function App() {
 
   const createConstraint = async () => {
     try {
-      await api.createConstraint({
+      const response = await api.createConstraint({
         title: newConstraintTitle,
         body: newConstraintBody,
         tags: ['research', 'draft'],
@@ -321,9 +343,29 @@ function App() {
       })
       message.success('Constraint document created')
       await refreshSharedData()
+      await loadConstraintDetail(response.data.document_id)
       setSection('constraints')
     } catch (error) {
       message.error(error instanceof Error ? error.message : 'Failed to create constraint')
+    }
+  }
+
+  const reviseConstraintDocument = async () => {
+    if (!selectedConstraintId) {
+      message.warning('Select a constraint document to revise')
+      return
+    }
+    try {
+      const response = await api.reviseConstraint(selectedConstraintId, {
+        title: newConstraintTitle.trim() || undefined,
+        body: newConstraintBody.trim() || undefined,
+      })
+      message.success('Constraint revision created')
+      await refreshSharedData()
+      await loadConstraintDetail(response.data.document_id)
+      setSection('constraints')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to revise constraint')
     }
   }
 
@@ -567,40 +609,467 @@ function App() {
     </Row>
   )
 
+  const loadConstraintGovernance = async (documentId: string, rootDocumentId: string) => {
+    const [versionsEnvelope, scenariosEnvelope, gateEnvelope] = await Promise.all([
+      api.listConstraintVersions(documentId),
+      api.listConstraintScenarios(rootDocumentId),
+      api.getConstraintGate(documentId),
+    ])
+    const versions = versionsEnvelope.data.data
+    const scenarios = scenariosEnvelope.data
+    setConstraintVersions(versions)
+    setConstraintScenarios(scenariosEnvelope.data)
+    setConstraintPublishGate(gateEnvelope.data)
+    setConstraintValidationReport(gateEnvelope.data.latest_validation_report || null)
+    setSelectedScenarioIds(scenarios.map((scenario) => scenario.scenario_id))
+    setConstraintCompareId(versions.length > 1 ? versions[versions.length - 2].document_id : null)
+    setConstraintDiff(null)
+  }
+
+  const loadConstraintDetail = async (documentId: string) => {
+    try {
+      const detailEnvelope = await api.getConstraint(documentId)
+      setConstraintDetail(detailEnvelope.data)
+      setSelectedConstraintId(documentId)
+      setVerifyConstraintSetId(documentId)
+      setNewConstraintTitle(detailEnvelope.data.document.title)
+      setNewConstraintBody(detailEnvelope.data.document.body)
+      await loadConstraintGovernance(
+        documentId,
+        detailEnvelope.data.document.root_document_id || detailEnvelope.data.document.document_id,
+      )
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to load constraint detail')
+    }
+  }
+
+  const publishConstraintDocument = async (documentId: string) => {
+    try {
+      const gateEnvelope = await api.getConstraintGate(documentId)
+      setConstraintPublishGate(gateEnvelope.data)
+      setConstraintValidationReport(gateEnvelope.data.latest_validation_report || null)
+      if (!gateEnvelope.data.publish_ready) {
+        message.error(gateEnvelope.data.blockers.join(' | ') || 'Constraint publish gate blocked')
+        return
+      }
+      await api.publishConstraintWithArchive(documentId)
+      message.success('Constraint published')
+      await refreshSharedData()
+      if (selectedConstraintId === documentId) {
+        await loadConstraintDetail(documentId)
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to publish constraint')
+    }
+  }
+
+  const archiveConstraintDocument = async (documentId: string) => {
+    try {
+      await api.archiveConstraint(documentId)
+      message.success('Constraint archived')
+      await refreshSharedData()
+      if (selectedConstraintId === documentId) {
+        setConstraintDetail(null)
+        setSelectedConstraintId(null)
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to archive constraint')
+    }
+  }
+
+  const runConstraintVerify = async () => {
+    try {
+      let payloadObj: Record<string, unknown> = {}
+      try {
+        payloadObj = JSON.parse(verifyPayloadJson)
+      } catch {
+        message.error('Invalid JSON payload')
+        return
+      }
+      const response = await api.verifyConstraint({
+        subject: verifySubject,
+        payload: payloadObj,
+        constraint_set_id: verifyConstraintSetId,
+      })
+      setVerifyResponse(response.data)
+      message.success('Constraint verification completed')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to verify constraint')
+    }
+  }
+
+  const saveConstraintScenario = async () => {
+    const rootDocumentId =
+      constraintDetail?.document.root_document_id || constraintDetail?.document.document_id || selectedConstraintId
+    if (!rootDocumentId) {
+      message.warning('Select a constraint document before saving scenarios')
+      return
+    }
+    try {
+      let payloadObj: Record<string, unknown> = {}
+      try {
+        payloadObj = JSON.parse(verifyPayloadJson)
+      } catch {
+        message.error('Invalid JSON payload')
+        return
+      }
+      await api.createConstraintScenario({
+        root_document_id: rootDocumentId,
+        name: scenarioName.trim() || `Scenario ${new Date().toISOString()}`,
+        subject: verifySubject,
+        payload: payloadObj,
+        expected_decision: (verifyResponse?.final_verdict.decision || 'deny') as 'allow' | 'approval_required' | 'deny',
+        tags: scenarioTags
+          .split(',')
+          .map((tag) => tag.trim())
+          .filter(Boolean),
+      })
+      message.success('Validation scenario saved')
+      await loadConstraintGovernance(selectedConstraintId || rootDocumentId, rootDocumentId)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to save scenario')
+    }
+  }
+
+  const runConstraintValidation = async () => {
+    if (!selectedConstraintId) {
+      message.warning('Select a constraint document to validate')
+      return
+    }
+    try {
+      const reportEnvelope = await api.validateConstraint(selectedConstraintId, {
+        scenario_ids: selectedScenarioIds,
+      })
+      setConstraintValidationReport(reportEnvelope.data)
+      const gateEnvelope = await api.getConstraintGate(selectedConstraintId)
+      setConstraintPublishGate(gateEnvelope.data)
+      message.success('Constraint validation completed')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to validate constraint')
+    }
+  }
+
+  const compareConstraintVersions = async (baseDocumentId: string, targetDocumentId: string) => {
+    try {
+      const diffEnvelope = await api.diffConstraints(baseDocumentId, targetDocumentId)
+      setConstraintDiff(diffEnvelope.data)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Failed to diff constraints')
+    }
+  }
+
   const renderConstraints = () => (
-    <Row gutter={[20, 20]}>
-      <Col xs={24} xl={9}>
-        <Card className="lab-panel sticky-panel" title="New Constraint Document">
-          <Space direction="vertical" size={16} className="w-full">
-            <Input value={newConstraintTitle} onChange={(event) => setNewConstraintTitle(event.target.value)} placeholder="Constraint title" />
-            <TextArea rows={8} value={newConstraintBody} onChange={(event) => setNewConstraintBody(event.target.value)} />
-            <Button type="primary" onClick={createConstraint}>
-              Create Constraint
-            </Button>
-          </Space>
-        </Card>
-      </Col>
-      <Col xs={24} xl={15}>
-        <Card className="lab-panel" title="Constraint Registry">
-          <List
-            dataSource={constraints}
-            renderItem={(item) => (
-              <List.Item actions={[item.status !== 'published' ? <Button size="small" onClick={() => void api.publishConstraint(item.document_id).then(refreshSharedData)}>Publish</Button> : null].filter(Boolean)}>
-                <List.Item.Meta
-                  title={
-                    <Space>
-                      <span>{item.title}</span>
-                      <StatusPill value={item.status} />
-                    </Space>
-                  }
-                  description={item.body}
-                />
-              </List.Item>
+    <Space direction="vertical" size={20} className="w-full">
+      <Row gutter={[20, 20]}>
+        <Col xs={24} lg={8}>
+          <Card className="lab-panel sticky-panel" title="Constraint Registry" extra={<Button size="small" onClick={createConstraint}>New Draft</Button>}>
+            <List
+              size="small"
+              dataSource={constraints}
+              renderItem={(item) => (
+                <List.Item
+                  className={`lab-list-item ${item.document_id === selectedConstraintId ? 'lab-list-item-active' : ''}`}
+                  onClick={() => void loadConstraintDetail(item.document_id)}
+                  actions={[
+                    item.status === 'candidate' ? (
+                      <Button size="small" type="primary" onClick={(e) => { e.stopPropagation(); void publishConstraintDocument(item.document_id) }}>
+                        Publish
+                      </Button>
+                    ) : null,
+                    item.status === 'published' || item.status === 'archived' ? (
+                      <Button size="small" onClick={(e) => { e.stopPropagation(); void archiveConstraintDocument(item.document_id) }}>
+                        Archive
+                      </Button>
+                    ) : null,
+                  ].filter(Boolean)}
+                >
+                  <List.Item.Meta
+                    title={
+                      <Space size="small">
+                        <span className="text-sm">{item.title}</span>
+                        <StatusPill value={item.status} />
+                        {item.compiled?.status === 'success' ? <Tag color="green">compiled</Tag> : item.compiled?.status === 'partial' ? <Tag color="orange">partial</Tag> : null}
+                      </Space>
+                    }
+                    description={
+                      <div className="text-xs">
+                        <Space size={4}>
+                          <Tag>p{item.priority}</Tag>
+                          <Text type="secondary">{item.version}</Text>
+                          {item.tags.slice(0, 2).map((tag) => <Tag key={tag}>{tag}</Tag>)}
+                        </Space>
+                      </div>
+                    }
+                  />
+                </List.Item>
+              )}
+            />
+            <Divider />
+            <Space direction="vertical" size={12} className="w-full">
+              <Input value={newConstraintTitle} onChange={(event) => setNewConstraintTitle(event.target.value)} placeholder="Constraint title" />
+              <TextArea rows={4} value={newConstraintBody} onChange={(event) => setNewConstraintBody(event.target.value)} placeholder="Constraint body (natural language rules)" />
+              <Space>
+                <Button type="primary" onClick={createConstraint}>Create Draft</Button>
+                <Button onClick={reviseConstraintDocument} disabled={!selectedConstraintId}>Revise Selected</Button>
+              </Space>
+            </Space>
+          </Card>
+        </Col>
+
+        <Col xs={24} lg={8}>
+          <Card className="lab-panel" title="Document Detail">
+            {constraintDetail ? (
+              <Space direction="vertical" size={16} className="w-full">
+                <Row gutter={[8, 8]}>
+                  <Col span={12}><Statistic title="Status" value={constraintDetail.document.status} /></Col>
+                  <Col span={12}><Statistic title="Priority" value={constraintDetail.document.priority} /></Col>
+                  <Col span={12}><Statistic title="Version" value={constraintDetail.document.version} /></Col>
+                  <Col span={12}><Statistic title="Scope" value={constraintDetail.document.scope} /></Col>
+                </Row>
+                <div>
+                  <Text className="lab-label">Tags</Text>
+                  <div>{constraintDetail.document.tags.map((tag) => <Tag key={tag}>{tag}</Tag>)}</div>
+                </div>
+                <Card size="small" title="Compile Summary">
+                  <Row gutter={[8, 8]}>
+                    <Col span={8}><Statistic title="Status" value={constraintDetail.compilation_summary.status || 'N/A'} /></Col>
+                    <Col span={8}><Statistic title="Rules" value={constraintDetail.compilation_summary.rule_count || 0} /></Col>
+                    <Col span={8}><Statistic title="Fallback" value={constraintDetail.compilation_summary.used_fallback ? 'Yes' : 'No'} /></Col>
+                  </Row>
+                  {constraintDetail.compilation_summary.errors.length > 0 && (
+                    <Alert type="warning" className="mt-2" message={`Compile errors: ${constraintDetail.compilation_summary.errors.join(', ')}`} />
+                  )}
+                </Card>
+                <div>
+                  <Text className="lab-label">Constraint Body</Text>
+                  <Paragraph className="lab-pre mt-2">{constraintDetail.document.body}</Paragraph>
+                </div>
+                <Space>
+                  {constraintDetail.document.status === 'candidate' && (
+                    <Button type="primary" onClick={() => void publishConstraintDocument(constraintDetail.document.document_id)}>
+                      Publish Document
+                    </Button>
+                  )}
+                  {(constraintDetail.document.status === 'published' || constraintDetail.document.status === 'archived') && (
+                    <Button onClick={() => void archiveConstraintDocument(constraintDetail.document.document_id)}>
+                      Archive Document
+                    </Button>
+                  )}
+                </Space>
+                <JsonCard title="Constraint Gate" value={constraintPublishGate || { note: 'Select a candidate to inspect publish blockers.' }} />
+              </Space>
+            ) : (
+              <Alert type="info" message="Select a constraint document from the registry to view details." showIcon />
             )}
-          />
-        </Card>
-      </Col>
-    </Row>
+          </Card>
+        </Col>
+
+        <Col xs={24} lg={8}>
+          <Card className="lab-panel sticky-panel" title="Verify Playground">
+            <Space direction="vertical" size={16} className="w-full">
+              <div>
+                <Text className="lab-label">Subject</Text>
+                <Input value={verifySubject} onChange={(event) => setVerifySubject(event.target.value)} placeholder="e.g., shell.exec, filesystem.write" />
+              </div>
+              <div>
+                <Text className="lab-label">Payload (JSON)</Text>
+                <TextArea rows={6} value={verifyPayloadJson} onChange={(event) => setVerifyPayloadJson(event.target.value)} placeholder='{"tool_name": "shell_exec", "action": "run", ...}' />
+              </div>
+              <div>
+                <Text className="lab-label">Constraint Set ID (optional)</Text>
+                <Input value={verifyConstraintSetId || ''} onChange={(event) => setVerifyConstraintSetId(event.target.value || null)} placeholder="Leave empty for all published constraints" />
+              </div>
+              <Button type="primary" onClick={runConstraintVerify}>
+                Verify Constraint
+              </Button>
+              <Divider />
+              <Input value={scenarioName} onChange={(event) => setScenarioName(event.target.value)} placeholder="Scenario name" />
+              <Input value={scenarioTags} onChange={(event) => setScenarioTags(event.target.value)} placeholder="scenario tags, comma separated" />
+              <Button onClick={saveConstraintScenario}>
+                Save Current Verify As Scenario
+              </Button>
+              {verifyResponse && (
+                <>
+                  <Divider />
+                  <Alert
+                    type={verifyResponse.final_verdict.decision === 'allow' ? 'success' : verifyResponse.final_verdict.decision === 'deny' ? 'error' : 'warning'}
+                    message={`Verdict: ${verifyResponse.final_verdict.decision.toUpperCase()}`}
+                    description={`${verifyResponse.final_verdict.reason} | version=${verifyResponse.constraint_document_version}`}
+                    showIcon
+                  />
+                  <Row gutter={[8, 8]}>
+                    <Col span={8}><Statistic title="Rules Compiled" value={verifyResponse.compiled_rule_count} /></Col>
+                    <Col span={8}><Statistic title="Evaluated" value={verifyResponse.explanation.evaluated_rules} /></Col>
+                    <Col span={8}><Statistic title="Fallback" value={verifyResponse.used_fallback ? 'Yes' : 'No'} /></Col>
+                  </Row>
+                  <Card size="small" title="Matched Rules">
+                    <List
+                      size="small"
+                      dataSource={verifyResponse.matched_rules}
+                      renderItem={(rule) => (
+                        <List.Item>
+                          <List.Item.Meta
+                            title={
+                              <Space size="small">
+                                <Tag color={rule.decision === 'allow' ? 'green' : rule.decision === 'deny' ? 'red' : 'orange'}>
+                                  {rule.decision}
+                                </Tag>
+                                <Text>{rule.rule_id}</Text>
+                                <Text type="secondary">{rule.source_document_version || 'n/a'}</Text>
+                              </Space>
+                            }
+                            description={
+                              <div>
+                                <Text className="text-xs">{rule.reason}</Text>
+                                <div className="mt-1">
+                                  {rule.matched_conditions.map((cond) => <Tag key={cond}>{cond}</Tag>)}
+                                </div>
+                              </div>
+                            }
+                          />
+                        </List.Item>
+                      )}
+                    />
+                  </Card>
+                  {verifyResponse.used_fallback && verifyResponse.explanation.fallback_reason && (
+                    <Alert type="warning" message="Fallback Mode Used" description={verifyResponse.explanation.fallback_reason} showIcon />
+                  )}
+                </>
+              )}
+            </Space>
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={[20, 20]}>
+        <Col xs={24} lg={8}>
+          <Card className="lab-panel" title="Versions & Diff">
+            {constraintDetail ? (
+              <Space direction="vertical" size={12} className="w-full">
+                <List
+                  size="small"
+                  dataSource={constraintVersions}
+                  renderItem={(item) => (
+                    <List.Item
+                      className={`lab-list-item ${item.document_id === selectedConstraintId ? 'lab-list-item-active' : ''}`}
+                      onClick={() => void loadConstraintDetail(item.document_id)}
+                    >
+                      <List.Item.Meta
+                        title={
+                          <Space size="small">
+                            <Text>{item.version}</Text>
+                            <StatusPill value={item.status} />
+                          </Space>
+                        }
+                        description={item.title}
+                      />
+                    </List.Item>
+                  )}
+                />
+                <Select
+                  value={constraintCompareId || undefined}
+                  onChange={setConstraintCompareId}
+                  placeholder="Compare against version"
+                  options={constraintVersions
+                    .filter((version) => version.document_id !== selectedConstraintId)
+                    .map((version) => ({
+                      value: version.document_id,
+                      label: `${version.version} (${version.status})`,
+                    }))}
+                />
+                <Button
+                  onClick={() => selectedConstraintId && constraintCompareId && void compareConstraintVersions(selectedConstraintId, constraintCompareId)}
+                  disabled={!selectedConstraintId || !constraintCompareId}
+                >
+                  Compare Versions
+                </Button>
+                <JsonCard title="Constraint Diff" value={constraintDiff || { note: 'Choose a version comparison to inspect diffs.' }} />
+              </Space>
+            ) : (
+              <Alert type="info" message="Select a constraint document to inspect its version chain." showIcon />
+            )}
+          </Card>
+        </Col>
+
+        <Col xs={24} lg={8}>
+          <Card className="lab-panel" title="Scenarios">
+            {constraintDetail ? (
+              <Space direction="vertical" size={12} className="w-full">
+                <Select
+                  mode="multiple"
+                  value={selectedScenarioIds}
+                  onChange={setSelectedScenarioIds}
+                  placeholder="Select validation scenarios"
+                  options={constraintScenarios.map((scenario) => ({
+                    value: scenario.scenario_id,
+                    label: `${scenario.name} (${scenario.expected_decision})`,
+                  }))}
+                />
+                <Button onClick={runConstraintValidation} disabled={!selectedConstraintId}>
+                  Run Validation Suite
+                </Button>
+                <List
+                  size="small"
+                  dataSource={constraintScenarios}
+                  renderItem={(scenario) => (
+                    <List.Item>
+                      <List.Item.Meta
+                        title={
+                          <Space size="small">
+                            <Text>{scenario.name}</Text>
+                            <Tag>{scenario.expected_decision}</Tag>
+                          </Space>
+                        }
+                        description={`${scenario.subject} | tags=${scenario.tags.join(', ') || 'none'}`}
+                      />
+                    </List.Item>
+                  )}
+                />
+              </Space>
+            ) : (
+              <Alert type="info" message="Select a constraint document to manage validation scenarios." showIcon />
+            )}
+          </Card>
+        </Col>
+
+        <Col xs={24} lg={8}>
+          <Card className="lab-panel" title="Validation Report & Publish Blockers">
+            {constraintValidationReport ? (
+              <Space direction="vertical" size={12} className="w-full">
+                <Alert
+                  type={constraintValidationReport.status === 'passed' ? 'success' : 'error'}
+                  message={`Validation ${constraintValidationReport.status.toUpperCase()}`}
+                  description={`passed=${constraintValidationReport.passed_scenarios}/${constraintValidationReport.total_scenarios} hard_failures=${constraintValidationReport.hard_failure_count}`}
+                  showIcon
+                />
+                <JsonCard title="Publish Blockers" value={constraintPublishGate?.blockers || []} />
+                <List
+                  size="small"
+                  dataSource={constraintValidationReport.scenario_results}
+                  renderItem={(result) => (
+                    <List.Item>
+                      <List.Item.Meta
+                        title={
+                          <Space size="small">
+                            <Text>{result.name}</Text>
+                            <Tag color={result.passed ? 'green' : result.hard_failure ? 'red' : 'orange'}>
+                              {`${result.expected_decision} -> ${result.actual_decision}`}
+                            </Tag>
+                          </Space>
+                        }
+                        description={`${result.explanation} | rules=${result.matched_rule_ids.join(', ') || 'none'}`}
+                      />
+                    </List.Item>
+                  )}
+                />
+              </Space>
+            ) : (
+              <Alert type="info" message="Run a validation suite to see publish blockers and scenario outcomes." showIcon />
+            )}
+          </Card>
+        </Col>
+      </Row>
+    </Space>
   )
 
   const renderContext = () => (
@@ -711,6 +1180,28 @@ function App() {
                 message={String(runDetail.data.result?.summary || 'No summary')}
                 showIcon
               />
+              <Card size="small" title="Constraint Evidence">
+                <Space direction="vertical" size={8} className="w-full">
+                  <Text>
+                    set={runDetail.data.constraint_set_id || runDetail.session?.constraint_set_id || 'n/a'} root=
+                    {runDetail.data.constraint_root_document_id || runDetail.session?.constraint_root_document_id || 'n/a'} version=
+                    {runDetail.data.constraint_version || runDetail.session?.constraint_version || 'n/a'}
+                  </Text>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      const constraintId = runDetail.data.constraint_set_id || runDetail.session?.constraint_set_id
+                      if (constraintId) {
+                        void loadConstraintDetail(constraintId)
+                        setSection('constraints')
+                      }
+                    }}
+                    disabled={!(runDetail.data.constraint_set_id || runDetail.session?.constraint_set_id)}
+                  >
+                    Open Constraint In Workbench
+                  </Button>
+                </Space>
+              </Card>
               <JsonCard title="Assigned Worker" value={runDetail.worker || {}} />
               <JsonCard title="Mission" value={runDetail.mission || {}} />
               <JsonCard title="Mission Phase" value={runDetail.mission_phase || {}} />
@@ -988,11 +1479,44 @@ function App() {
     </Row>
   )
 
+  const constraintEngineStatus = useMemo(() => {
+    if (!health) return null
+    return {
+      constraint_engine_version: health.constraint_engine_version as string || 'v2',
+      constraint_parser_ready: health.constraint_parser_ready as boolean ?? true,
+      constraint_compiler_ready: health.constraint_compiler_ready as boolean ?? true,
+      constraint_fallback_mode: health.constraint_fallback_mode as boolean ?? false,
+      published_constraint_count: health.published_constraint_count as number || constraints.filter(c => c.status === 'published').length,
+      total_constraint_count: health.total_constraint_count as number || constraints.length,
+    } as ConstraintEngineStatus
+  }, [health, constraints])
+
   const renderSettings = () => (
     <Row gutter={[20, 20]}>
       <Col xs={24} xl={8}>
         <Card className="lab-panel sticky-panel" title="Health & Doctor">
           <Space direction="vertical" size={16} className="w-full">
+            {/* Constraint Engine Status */}
+            {constraintEngineStatus && (
+              <Card size="small" title="Constraint Engine">
+                <Row gutter={[8, 8]}>
+                  <Col span={8}><Statistic title="Version" value={constraintEngineStatus.constraint_engine_version} /></Col>
+                  <Col span={8}><Statistic title="Published" value={constraintEngineStatus.published_constraint_count} /></Col>
+                  <Col span={8}><Statistic title="Total" value={constraintEngineStatus.total_constraint_count} /></Col>
+                </Row>
+                <Space className="mt-2">
+                  <Tag color={constraintEngineStatus.constraint_parser_ready ? 'green' : 'red'}>
+                    Parser: {constraintEngineStatus.constraint_parser_ready ? 'Ready' : 'Down'}
+                  </Tag>
+                  <Tag color={constraintEngineStatus.constraint_compiler_ready ? 'green' : 'red'}>
+                    Compiler: {constraintEngineStatus.constraint_compiler_ready ? 'Ready' : 'Down'}
+                  </Tag>
+                  {constraintEngineStatus.constraint_fallback_mode && (
+                    <Tag color="orange">Fallback Mode</Tag>
+                  )}
+                </Space>
+              </Card>
+            )}
             <JsonCard title="Runtime Health" value={health || {}} />
             <Button onClick={registerWorker}>Register Local Worker</Button>
           </Space>

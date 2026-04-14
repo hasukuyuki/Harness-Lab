@@ -62,7 +62,7 @@ AttemptStatus = Literal["leased", "running", "completed", "failed", "blocked", "
 LeaseStatus = Literal["leased", "running", "completed", "failed", "released", "expired"]
 KnowledgeSourceType = Literal["workspace", "docs", "artifacts"]
 KnowledgeReindexScope = Literal["workspace", "docs", "artifacts", "all"]
-SandboxMode = Literal["host_local", "docker"]
+SandboxMode = Literal["host_local", "docker", "microvm", "microvm_stub"]
 SandboxNetworkPolicy = Literal["none", "restricted", "default"]
 
 # Side effect classification for hardened sandbox governance

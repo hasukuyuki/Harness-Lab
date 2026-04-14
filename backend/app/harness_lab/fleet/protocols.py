@@ -38,6 +38,27 @@ class RunCoordinationProtocol(Protocol):
         """Mark nodes ready for dispatch and return if any changed."""
         ...
 
+    def record_handoffs(
+        self,
+        run: ResearchRun,
+        session: ResearchSession,
+        node: TaskNode,
+    ) -> List[Any]:
+        """Record handoff packets for a completed node.
+        
+        This enables fleet layer to trigger handoff recording without
+        depending on RuntimeService private methods.
+        
+        Args:
+            run: ResearchRun being processed
+            session: ResearchSession containing task graph
+            node: TaskNode that was completed
+            
+        Returns:
+            List of HandoffPacket objects created
+        """
+        ...
+
 
 @runtime_checkable
 class DispatchConstraintProtocol(Protocol):

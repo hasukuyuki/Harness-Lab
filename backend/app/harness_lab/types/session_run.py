@@ -75,6 +75,9 @@ class ExecutionTrace(BaseModel):
     trace_id: str
     session_id: str
     prompt_frame_id: str
+    constraint_document_id: Optional[str] = None
+    constraint_root_document_id: Optional[str] = None
+    constraint_version: Optional[str] = None
     intent_declaration: "IntentDeclaration"
     model_calls: List["ModelCallTrace"] = Field(default_factory=list)
     context_blocks: List[ContextBlock] = Field(default_factory=list)
@@ -106,6 +109,8 @@ class ResearchSession(BaseModel):
     active_policy_id: str
     workflow_template_id: Optional[str] = None
     constraint_set_id: str
+    constraint_root_document_id: Optional[str] = None
+    constraint_version: Optional[str] = None
     context_profile_id: str
     prompt_template_id: str
     model_profile_id: str
@@ -129,6 +134,9 @@ class ResearchRun(BaseModel):
     mission_id: Optional[str] = None
     policy_id: Optional[str] = None
     workflow_template_id: Optional[str] = None
+    constraint_set_id: Optional[str] = None
+    constraint_root_document_id: Optional[str] = None
+    constraint_version: Optional[str] = None
     assigned_worker_id: Optional[str] = None
     current_attempt_id: Optional[str] = None
     active_lease_id: Optional[str] = None

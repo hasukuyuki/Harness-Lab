@@ -1,3 +1,5 @@
+"""Artifact store contract tests shared across local and S3-compatible backends."""
+
 from __future__ import annotations
 
 import io

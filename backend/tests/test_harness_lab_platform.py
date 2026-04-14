@@ -342,6 +342,119 @@ def test_model_reflection_path_and_shell_approval_flow(client, monkeypatch):
     assert "test-key" not in replay_body
 
 
+def test_constraint_governance_routes_require_validation_gate_and_expose_version_metadata(client):
+    create_response = client.post(
+        "/api/constraints",
+        json={
+            "title": "Destructive shell safety",
+            "body": "Deny destructive shell commands. Require approval for shell commands that mutate the workspace.",
+            "tags": ["shell", "safety"],
+            "priority": 90,
+        },
+    )
+    assert create_response.status_code == 200
+    document = create_response.json()["data"]
+
+    verify_response = client.post(
+        "/api/constraints/verify",
+        json={
+            "subject": "tool.shell.execute",
+            "constraint_set_id": document["document_id"],
+            "payload": {"command": "rm -rf build"},
+        },
+    )
+    assert verify_response.status_code == 200
+    verify_payload = verify_response.json()["data"]
+    assert verify_payload["constraint_document_id"] == document["document_id"]
+    assert verify_payload["constraint_root_document_id"] == document["root_document_id"]
+    assert verify_payload["constraint_document_version"] == document["version"]
+
+    blocked_publish = client.post(f"/api/constraints/{document['document_id']}/publish-with-archive")
+    assert blocked_publish.status_code == 409
+    assert "validation" in blocked_publish.json()["detail"].lower()
+
+    scenario_response = client.post(
+        "/api/constraints/scenarios",
+        json={
+            "root_document_id": document["root_document_id"],
+            "name": "deny destructive shell",
+            "subject": "tool.shell.execute",
+            "payload": {"command": "rm -rf build"},
+            "expected_decision": "deny",
+            "tags": ["shell", "destructive"],
+        },
+    )
+    assert scenario_response.status_code == 200
+    scenario = scenario_response.json()["data"]
+
+    scenarios_response = client.get(
+        "/api/constraints/scenarios",
+        params={"root_document_id": document["root_document_id"]},
+    )
+    assert scenarios_response.status_code == 200
+    scenarios = scenarios_response.json()["data"]
+    assert [item["scenario_id"] for item in scenarios] == [scenario["scenario_id"]]
+
+    validate_response = client.post(
+        f"/api/constraints/{document['document_id']}/validate",
+        json={"scenario_ids": [scenario["scenario_id"]]},
+    )
+    assert validate_response.status_code == 200
+    report = validate_response.json()["data"]
+    assert report["status"] == "passed"
+    assert report["passed_scenarios"] == 1
+    assert report["scenario_results"][0]["matched_document_ids"] == [document["document_id"]]
+
+    gate_response = client.get(f"/api/constraints/{document['document_id']}/gate")
+    assert gate_response.status_code == 200
+    gate = gate_response.json()["data"]
+    assert gate["publish_ready"] is True
+    assert gate["document_version"] == document["version"]
+    assert gate["latest_validation_report"]["report_id"] == report["report_id"]
+
+    publish_response = client.post(f"/api/constraints/{document['document_id']}/publish-with-archive")
+    assert publish_response.status_code == 200
+    publish_payload = publish_response.json()["data"]
+    assert publish_payload["document"]["status"] == "published"
+    assert publish_payload["gate"]["publish_ready"] is True
+
+
+def test_run_detail_exposes_constraint_version_evidence(client, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _mock_provider(monkeypatch, intent_tool="knowledge_search")
+
+    session_response = client.post(
+        "/api/sessions",
+        json={
+            "goal": "Search the runtime implementation before making changes.",
+            "context": {"path": "backend/app/harness_lab/runtime"},
+            "execution_mode": "single_worker",
+        },
+    )
+    assert session_response.status_code == 200
+    session_payload = session_response.json()["data"]
+
+    run_response = client.post("/api/runs", json={"session_id": session_payload["session_id"]})
+    assert run_response.status_code == 200
+    run_payload = run_response.json()["data"]
+
+    assert run_payload["constraint_set_id"] == session_payload["constraint_set_id"]
+    assert run_payload["constraint_root_document_id"] == session_payload["constraint_root_document_id"]
+    assert run_payload["constraint_version"] == session_payload["constraint_version"]
+
+    run_detail = client.get(f"/api/runs/{run_payload['run_id']}")
+    assert run_detail.status_code == 200
+    detail_payload = run_detail.json()
+    assert detail_payload["data"]["constraint_set_id"] == session_payload["constraint_set_id"]
+    assert detail_payload["data"]["constraint_root_document_id"] == session_payload["constraint_root_document_id"]
+    assert detail_payload["data"]["constraint_version"] == session_payload["constraint_version"]
+    assert detail_payload["data"]["execution_trace"]["constraint_document_id"] == session_payload["constraint_set_id"]
+    assert detail_payload["data"]["execution_trace"]["constraint_root_document_id"] == session_payload["constraint_root_document_id"]
+    assert detail_payload["data"]["execution_trace"]["constraint_version"] == session_payload["constraint_version"]
+    assert detail_payload["data"]["execution_trace"]["policy_verdicts"][0]["source_document_id"] == session_payload["constraint_set_id"]
+    assert detail_payload["data"]["execution_trace"]["policy_verdicts"][0]["source_document_version"] == session_payload["constraint_version"]
+
+
 def test_policy_compare_and_experiment_registry(client):
     policies = client.get("/api/policies")
     assert policies.status_code == 200
@@ -865,7 +978,7 @@ def test_policy_and_workflow_candidates_auto_evaluate_from_multi_agent_traces(cl
     assert workflow_payload["gate"]["approval_required"] is True
 
 
-def test_candidate_gate_blocks_multi_agent_handoff_and_dispatch_regressions():
+def test_candidate_gate_blocks_multi_agent_handoff_and_dispatch_regressions(client):
     candidate = {
         "candidate_id": "candidate_test",
         "kind": "policy",

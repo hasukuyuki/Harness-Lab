@@ -86,6 +86,8 @@ class SandboxSpec(BaseModel):
     approval_token: Optional[str] = None
     # Hardened config
     hardened_config: Optional[HardenedSandboxConfig] = None
+    # Backend hint for executor selection
+    backend_hint: Optional[str] = None
 
 
 class SandboxTrace(BaseModel):
@@ -110,6 +112,13 @@ class SandboxTrace(BaseModel):
     evidence: Optional[SandboxEvidence] = None
     policy_verdict: Optional[PolicyVerdictSnapshot] = None
     approval_context: Optional[ApprovalContext] = None
+    # Backend identification for cross-backend replay and troubleshooting
+    backend: Optional[str] = None
+    executor_version: Optional[str] = None
+    vm_id: Optional[str] = None
+    guest_image: Optional[str] = None
+    kernel_image: Optional[str] = None
+    snapshot_id: Optional[str] = None
 
 
 class SandboxResult(BaseModel):
@@ -155,6 +164,11 @@ class SandboxStatus(BaseModel):
     active_sandbox_count: int = 0
     total_executions_24h: int = 0
     failure_count_24h: int = 0
+    # Executor abstraction fields
+    executor_ready: bool = False
+    executor_capabilities: Dict[str, bool] = Field(default_factory=dict)
+    executor_version: Optional[str] = None
+    executor_status: Optional[Dict[str, Any]] = Field(default=None, description="Detailed executor status from registry")
 
 
 class ToolCallRecord(BaseModel):

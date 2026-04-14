@@ -216,7 +216,7 @@ class WorkerExecutionLoop:
                 labels=labels or ["cli", "remote-worker"],
                 execution_mode=execution_mode,
                 sandbox_backend=sandbox_status.sandbox_backend,
-                sandbox_ready=sandbox_status.docker_ready and sandbox_status.sandbox_image_ready,
+                sandbox_ready=sandbox_status.executor_ready,
                 sandbox_hardened_ready=sandbox_status.hardened_ready,
                 version=version,
             )
@@ -267,7 +267,7 @@ class WorkerExecutionLoop:
                     current_lease_id=None,
                     role_profile=effective_role_profile,
                     sandbox_backend=sandbox_status.sandbox_backend,
-                    sandbox_ready=sandbox_status.docker_ready and sandbox_status.sandbox_image_ready,
+                    sandbox_ready=sandbox_status.executor_ready,
                 ),
             )
             response = self.client.poll_worker(worker_id, WorkerPollRequest(max_tasks=max(1, max_tasks)))
@@ -298,9 +298,7 @@ class WorkerExecutionLoop:
                 current_lease_id=dispatch.lease_id,
                 role_profile=role_profile,
                 sandbox_backend=self.settings.sandbox_backend,
-                sandbox_ready=not dispatch.requires_sandbox or (
-                    self.sandbox_manager.status().docker_ready and self.sandbox_manager.status().sandbox_image_ready
-                ),
+                sandbox_ready=not dispatch.requires_sandbox or self.sandbox_manager.status().executor_ready,
             ),
         )
         stop_heartbeat = threading.Event()
@@ -396,7 +394,7 @@ class WorkerExecutionLoop:
                     current_lease_id=None,
                     role_profile=None,
                     sandbox_backend=self.settings.sandbox_backend,
-                    sandbox_ready=self.sandbox_manager.status().docker_ready and self.sandbox_manager.status().sandbox_image_ready,
+                    sandbox_ready=self.sandbox_manager.status().executor_ready,
                     last_error=final_error,
                 ),
             )
@@ -536,7 +534,7 @@ class WorkerExecutionLoop:
                         current_lease_id=dispatch.lease_id,
                         role_profile=role_profile,
                         sandbox_backend=sandbox_status.sandbox_backend,
-                        sandbox_ready=sandbox_status.docker_ready and sandbox_status.sandbox_image_ready,
+                        sandbox_ready=sandbox_status.executor_ready,
                     ),
                 )
             except Exception:  # noqa: BLE001
