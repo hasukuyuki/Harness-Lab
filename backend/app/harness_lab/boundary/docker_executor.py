@@ -317,8 +317,9 @@ class DockerSandboxExecutor(SandboxExecutor):
         tool_command: List[str]
 
         # Build tool-specific command
+        # Note: Using "sh -c" without "-l" to avoid shell injection via login profiles
         if action.tool_name == "shell":
-            tool_command = ["sh", "-lc", str(action.payload.get("command", ""))]
+            tool_command = ["sh", "-c", str(action.payload.get("command", ""))]
 
         elif action.tool_name == "git":
             git_action = str(action.payload.get("action", "status") or "status")
@@ -327,7 +328,7 @@ class DockerSandboxExecutor(SandboxExecutor):
                 "diff": "git diff --stat",
                 "log": "git log --oneline -5",
             }
-            tool_command = ["sh", "-lc", git_command_map.get(git_action, "git status --short")]
+            tool_command = ["sh", "-c", git_command_map.get(git_action, "git status --short")]
 
         elif action.tool_name == "http_fetch":
             url = str(action.payload.get("url", "") or "")
@@ -366,7 +367,7 @@ class DockerSandboxExecutor(SandboxExecutor):
             tool_command = ["python", "-c", python_script, target]
 
         else:
-            tool_command = ["sh", "-lc", "printf 'unsupported sandbox action' >&2; exit 2"]
+            tool_command = ["sh", "-c", "printf 'unsupported sandbox action' >&2; exit 2"]
 
         command.append(spec.image)
         command.extend(tool_command)

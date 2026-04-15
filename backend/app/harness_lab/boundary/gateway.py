@@ -4,6 +4,7 @@ import asyncio
 import difflib
 import hashlib
 import json
+import shlex
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,6 +41,10 @@ class ToolGateway:
         self.knowledge_index = knowledge_index
         self.sandbox_manager = sandbox_manager
         self.repo_root = database.repo_root
+        self._allowed_commands = frozenset([
+            "ls", "cat", "git", "pwd", "echo", "find", "grep", "head", "tail",
+            "wc", "sort", "uniq", "diff", "mkdir", "touch", "rm", "mv", "cp",
+        ])
         self._descriptors = [
             ToolDescriptor(
                 name="shell",
@@ -219,8 +224,26 @@ class ToolGateway:
         command = str(payload.get("command", "") or "")
         if not command:
             return ToolExecutionResult(ok=False, error="Shell command is required")
-        process = await asyncio.create_subprocess_shell(
-            command,
+        
+        # Parse command to extract the base command name
+        try:
+            args = shlex.split(command)
+        except ValueError as e:
+            return ToolExecutionResult(ok=False, error=f"Invalid shell command syntax: {e}")
+        
+        if not args:
+            return ToolExecutionResult(ok=False, error="Shell command is empty after parsing")
+        
+        base_cmd = args[0]
+        if base_cmd not in self._allowed_commands:
+            return ToolExecutionResult(
+                ok=False,
+                error=f"Command '{base_cmd}' is not allowed. Allowed commands: {', '.join(sorted(self._allowed_commands))}"
+            )
+        
+        # Use create_subprocess_exec for safer execution (no shell interpretation)
+        process = await asyncio.create_subprocess_exec(
+            *args,
             cwd=str(self.repo_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

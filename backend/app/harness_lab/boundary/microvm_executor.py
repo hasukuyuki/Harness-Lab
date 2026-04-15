@@ -314,8 +314,9 @@ class MicroVMSandboxExecutor(SandboxExecutor):
         return process, timed_out, stdout, stderr
 
     def _build_runner_command(self, action: ActionPlan) -> List[str]:
+        # Note: Using "sh -c" without "-l" to avoid shell injection via login profiles
         if action.tool_name == "shell":
-            return ["sh", "-lc", str(action.payload.get("command", ""))]
+            return ["sh", "-c", str(action.payload.get("command", ""))]
         if action.tool_name == "git":
             git_action = str(action.payload.get("action", "status") or "status")
             git_command_map = {
@@ -323,7 +324,7 @@ class MicroVMSandboxExecutor(SandboxExecutor):
                 "diff": "git diff --stat",
                 "log": "git log --oneline -5",
             }
-            return ["sh", "-lc", git_command_map.get(git_action, "git status --short")]
+            return ["sh", "-c", git_command_map.get(git_action, "git status --short")]
         if action.tool_name == "http_fetch":
             python_bin = self._python_runner()
             script = (
@@ -351,7 +352,7 @@ class MicroVMSandboxExecutor(SandboxExecutor):
                 str(action.payload.get("path", "") or ""),
                 str(action.payload.get("content", "")),
             ]
-        return ["sh", "-lc", "printf 'unsupported microvm action' >&2; exit 2"]
+        return ["sh", "-c", "printf 'unsupported microvm action' >&2; exit 2"]
 
     def _python_runner(self) -> str:
         candidate = Path(self.microvm_binary)

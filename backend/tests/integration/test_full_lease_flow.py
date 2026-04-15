@@ -6,8 +6,9 @@ This test verifies that:
 3. Bootstrap doesn't use WorkerService
 """
 
-import sys
-sys.path.insert(0, '/home/kyj/文档/program/programmer (wokerflow)/backend')
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # backend directory
 
 
 def test_worker_registry_interface():
@@ -125,7 +126,7 @@ def test_bootstrap_no_workerservice():
     """Test bootstrap doesn't use WorkerService."""
     print("\n=== Test: Bootstrap Cleanup ===\n")
     
-    with open('/home/kyj/文档/program/programmer (wokerflow)/backend/app/harness_lab/bootstrap.py', 'r') as f:
+    with open(PROJECT_ROOT / 'app/harness_lab/bootstrap.py', 'r') as f:
         source = f.read()
     
     assert "WorkerService" not in source
@@ -141,7 +142,7 @@ def test_lease_manager_no_workerservice():
     """Test lease_manager doesn't use WorkerService fallback."""
     print("\n=== Test: LeaseManager Cleanup ===\n")
     
-    with open('/home/kyj/文档/program/programmer (wokerflow)/backend/app/harness_lab/fleet/lease_manager.py', 'r') as f:
+    with open(PROJECT_ROOT / 'app/harness_lab/fleet/lease_manager.py', 'r') as f:
         source = f.read()
     
     assert "from ..workers.service import WorkerService" not in source
@@ -160,7 +161,7 @@ def test_execution_plane_clean():
     """Test execution_plane doesn't have old LeaseManager."""
     print("\n=== Test: Execution Plane Cleanup ===\n")
     
-    with open('/home/kyj/文档/program/programmer (wokerflow)/backend/app/harness_lab/runtime/execution_plane.py', 'r') as f:
+    with open(PROJECT_ROOT / 'app/harness_lab/runtime/execution_plane.py', 'r') as f:
         source = f.read()
     
     # Should have RunCoordinator and LocalWorkerAdapter

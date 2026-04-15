@@ -1389,7 +1389,14 @@ class SqliteTestPlatformStore(BaseSqlPlatformStore):
         return None
 
     def _schema_statements(self) -> List[str]:
-        return [statement for statement in SQLITE_SCHEMA_SCRIPT.split(";\n\n") if statement.strip()]
+        # SQLite executescript handles multi-statement scripts directly
+        return [SQLITE_SCHEMA_SCRIPT]
+
+    def _initialize(self) -> None:
+        # Use executescript for SQLite (handles multiple statements)
+        with self.connection() as conn:
+            conn.executescript(SQLITE_SCHEMA_SCRIPT)
+        self._ensure_schema_evolution()
 
     def _ensure_schema_evolution(self) -> None:
         self._ensure_column("sessions", "workflow_template_id", "TEXT")
