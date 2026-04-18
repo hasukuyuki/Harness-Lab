@@ -608,6 +608,7 @@ def get_publisher() -> WebSocketEventPublisher:
     Returns:
         WebSocketEventPublisher instance
     """
+    global _publisher  # Fix: declare as global to avoid UnboundLocalError
     if _publisher is None:
         from .websocket import manager
         _publisher = WebSocketEventPublisher(manager)

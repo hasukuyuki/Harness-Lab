@@ -100,7 +100,7 @@ class Dispatcher:
         
         This is the primary dispatch entry point. It:
         1. Optionally reclaims stale leases first
-        2. Checks worker drain state
+        2. Checks worker drain state and worker state (offline/unhealthy workers skipped)
         3. Polls ready queue for candidate tasks
         4. Validates task constraints match worker capabilities
         5. Creates dispatch envelope on match
@@ -114,12 +114,17 @@ class Dispatcher:
             
         Returns:
             DispatchEnvelope if task assigned, None otherwise
+            Returns None if worker is draining, offline, or unhealthy
         """
         if reclaim_first:
             self._reclaim_stale_leases(coordination, constraints)
         
         # Draining workers don't receive new dispatches
         if worker.drain_state == "draining":
+            return None
+        
+        # Offline or unhealthy workers cannot execute tasks
+        if worker.state in {"offline", "unhealthy"}:
             return None
         
         inspected = 0
@@ -496,8 +501,17 @@ class Dispatcher:
         """Check if worker can poll tasks from shard.
         
         Shard format: "{role}/{risk_level}/{label1}/{label2}/..."
+        
+        Worker must be:
+        - Not in draining state
+        - Not offline or unhealthy
         """
+        # Draining workers don't receive new dispatches
         if worker.drain_state == "draining":
+            return False
+        
+        # Offline or unhealthy workers cannot execute tasks
+        if worker.state in {"offline", "unhealthy"}:
             return False
         
         parts = shard.split("/")
@@ -721,8 +735,17 @@ class Dispatcher:
             
         Returns:
             True if worker can poll from shard
+            
+        Worker must be:
+        - Not in draining state
+        - Not offline or unhealthy
         """
+        # Draining workers don't receive new dispatches
         if worker.drain_state == "draining":
+            return False
+        
+        # Offline or unhealthy workers cannot execute tasks
+        if worker.state in {"offline", "unhealthy"}:
             return False
         
         parts = shard.split("/")

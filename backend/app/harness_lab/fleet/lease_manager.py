@@ -1140,8 +1140,18 @@ class LeaseManager:
         )
 
     def _worker_can_poll_shard(self, worker: WorkerSnapshot, shard: str) -> bool:
-        """Check if worker can poll tasks from shard."""
+        """Check if worker can poll tasks from shard.
+        
+        Worker must be:
+        - Not in draining state
+        - Not offline or unhealthy
+        """
+        # Draining workers don't receive new dispatches
         if worker.drain_state == "draining":
+            return False
+        
+        # Offline or unhealthy workers cannot execute tasks
+        if worker.state in {"offline", "unhealthy"}:
             return False
         
         parts = shard.split("/")

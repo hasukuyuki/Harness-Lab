@@ -565,7 +565,6 @@ def main() -> None:
             return
 
         if args.canary_command == "analyze":
-            import asyncio
             try:
                 response = asyncio.run(
                     harness_lab_services.improvement.analyze_rollout(args.candidate_id)

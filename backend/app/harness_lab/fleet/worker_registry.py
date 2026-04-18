@@ -280,13 +280,27 @@ class WorkerRegistry:
         return self.set_drain_state(worker_id, "active")
 
     def ensure_default_worker(self) -> WorkerSnapshot:
-        """Ensure default control-plane worker exists."""
+        """Ensure default control-plane worker exists and is active.
+        
+        If the worker exists but is offline, update heartbeat to make it active.
+        This ensures that the default worker can actually execute tasks.
+        """
         row = self.database.fetchone(
             "SELECT payload_json FROM workers WHERE worker_id = ?",
             ("worker_control_plane_local",)
         )
         if row:
-            return WorkerSnapshot(**json.loads(row["payload_json"]))
+            worker = WorkerSnapshot(**json.loads(row["payload_json"]))
+            # Apply state derivation to check if offline
+            worker = self._derive_state(worker)
+            # If offline, re-activate by updating heartbeat
+            if worker.state == "offline":
+                now = utc_now()
+                worker.state = "idle"
+                worker.heartbeat_at = now
+                worker.updated_at = now
+                self._persist(worker)
+            return worker
         return self.register_worker(
             WorkerRegisterRequest(
                 worker_id="worker_control_plane_local",
@@ -305,15 +319,18 @@ class WorkerRegistry:
         """Acquire a worker for executing a task.
         
         Transitions worker to 'executing' state and assigns run/task.
+        Only acquires workers that are active (idle/registering state, not draining).
+        Falls back to ensure_default_worker() if no active workers are available.
         """
         workers = self.list_workers()
-        if not workers:
+        # Find an active worker (idle or registering, not draining)
+        worker = next(
+            (item for item in workers if item.drain_state == "active" and item.state in {"idle", "registering"}),
+            None,
+        )
+        # If no active worker available, use default worker (which will be re-activated if offline)
+        if worker is None:
             worker = self.ensure_default_worker()
-        else:
-            worker = next(
-                (item for item in workers if item.drain_state == "active" and item.state in {"idle", "registering"}),
-                workers[0],
-            )
         worker.state = "executing"
         worker.current_run_id = run_id
         worker.current_task_node_id = task_node_id
